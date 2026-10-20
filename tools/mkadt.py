@@ -185,7 +185,9 @@ def build(seed=None, qemu=False, highmem=False):
             ('canvas-height', u32(2436)),
         ])])
 
-    fbcon = node('rmx2117-fbcon', [
+    # Name must stay 'sweet-fbcon': xnu patch 0003's fbcon_probe() does
+    # SecureDTFindEntry("name", "sweet-fbcon").
+    fbcon = node('sweet-fbcon', [
         ph(),
         ('reg', u64(FB, FB_SIZE)),
         ('width', u32(FB_W)),
@@ -193,8 +195,9 @@ def build(seed=None, qemu=False, highmem=False):
         ('stride', u32(FB_STRIDE)),
     ])
 
-    # The UFS host LK leaves running (absolute physical reg).
-    ufs = node('rmx2117-ufs', [
+    # The UFS host LK leaves running (absolute physical reg). Name must
+    # stay 'sweet-ufs': xnu patch 0028 does SecureDTLookupEntry("/sweet-ufs").
+    ufs = node('sweet-ufs', [
         ph(),
         ('compatible', cstr('mediatek,ufshci')),
         ('reg', u64(UFS, UFS_SIZE)),
