@@ -1,1 +1,0 @@
-#define CONFIG_UBSAN_MINIMAL 0

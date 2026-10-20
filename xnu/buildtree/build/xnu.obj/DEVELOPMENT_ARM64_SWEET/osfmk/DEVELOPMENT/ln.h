@@ -1,1 +1,0 @@
-#define NLN 0

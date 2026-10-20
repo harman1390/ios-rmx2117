@@ -1,1 +1,0 @@
-#define CONFIG_NEXUS_NETIF 1
