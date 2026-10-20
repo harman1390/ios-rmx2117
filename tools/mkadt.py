@@ -193,6 +193,10 @@ def build(seed=None, qemu=False, highmem=False):
         ('width', u32(FB_W)),
         ('height', u32(FB_H)),
         ('stride', u32(FB_STRIDE)),
+        # MT6853 cmd-mode panel: a frame only reaches the panel's GRAM
+        # after dsi0 DSI_START (0x1401300C) 0->1. Kernel patch 0082
+        # reads this phys address and kicks it after each fb update.
+        ('kick-reg', u64(0x14013000)),
     ])
 
     # The UFS host LK leaves running (absolute physical reg). Name must

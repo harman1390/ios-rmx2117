@@ -1,0 +1,32 @@
+uncompr.o: \
+  /Users/runner/work/ios-rmx2117/ios-rmx2117/dxb/xnu/libkern/zlib/uncompr.c \
+  meta_features.h libkerncpp.h kdebug.h config_dtrace.h hibernation.h \
+  iotracking.h networking.h crypto.h zlib.h zlibc.h config_kxld.h \
+  /Users/runner/work/ios-rmx2117/ios-rmx2117/dxb/xnu/libkern/libkern/zlib.h \
+  /Users/runner/work/ios-rmx2117/ios-rmx2117/dxb/xnu/libkern/libkern/zconf.h
+
+meta_features.h:
+
+libkerncpp.h:
+
+kdebug.h:
+
+config_dtrace.h:
+
+hibernation.h:
+
+iotracking.h:
+
+networking.h:
+
+crypto.h:
+
+zlib.h:
+
+zlibc.h:
+
+config_kxld.h:
+
+/Users/runner/work/ios-rmx2117/ios-rmx2117/dxb/xnu/libkern/libkern/zlib.h:
+
+/Users/runner/work/ios-rmx2117/ios-rmx2117/dxb/xnu/libkern/libkern/zconf.h:
