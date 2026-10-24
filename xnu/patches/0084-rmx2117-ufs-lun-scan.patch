@@ -1,0 +1,36 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index 0000000..0000000 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -4,8 +4,9 @@
+  * The Qualcomm UFS host (UFSHCI 2.1) is left enabled with the link up by the
+  * bootloader, which loaded our boot image from it. This driver reuses that
+  * state: it points the transfer request list at its own memory (verifying the
+- * host took it before ringing any doorbell) and issues polled SCSI commands,
+- * one at a time, to LUN 0. It finds one GPT partition by name (boot-arg
++ * host took it before ringing any doorbell) and issues polled SCSI commands,
++ * one at a time. It scans LUNs for a GPT holding the wanted partition
++ * (rmx2117/MT6853: LUN2; LUN0/1 are 4 MiB boot LUs) by name (boot-arg
+  * ufsroot=, default "userdata") and exposes it as the BSD disk ufsroot0
+  * (rufsroot0), with 512-byte logical sectors over the device's 4 KiB blocks.
+  * Root on it with rd=ufsroot0.
+@@ -629,7 +630,17 @@
+ 		for (int i = 0; i < 3 && (error = ufs_scsi(tur, sizeof(tur), 0, false)); i++) {
+ 		}
+ 	}
+ 	if (!error) {
+-		error = ufs_find_partition(want);
++		/*
++		 * rmx2117 (MT6853): LUN0/1 are 4 MiB boot LUs; the GPT lives on
++		 * LUN2. Scan LUNs until one yields a GPT containing the partition.
++		 * On sweet the GPT is on LUN0, which is tried first anyway.
++		 */
++		for (su.lun = 0; su.lun <= 7; su.lun++) {
++			error = ufs_find_partition(want);
++			if (error == 0 || (error != ENXIO && error != ENOENT)) {
++				break;
++			}
++		}
+ 	}
+ 	lck_mtx_unlock(&sweet_ufs_lock);
+ 	if (error) {
