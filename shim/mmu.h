@@ -1,7 +1,7 @@
 #pragma once
 #include <stdint.h>
 
-#define FB_PHYS	0x7e605000UL	/* LK atag videolfb-fb_base (k6853v1_64) */
+#define FB_PHYS	0x77e20000UL	/* verified OVL L0 fb (same as console.h FB_BASE) */
 
 struct mmu_info {
 	uint64_t img_lo, img_hi, ttbr;

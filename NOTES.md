@@ -159,3 +159,37 @@ Remaining: `ufs_log_write()` can now stream the real log; next milestone = actua
 `research/ipsw-x/d22ap.adt` extracted from iPhone10,3 16.7.16 (20H392) IPSW (bvx2/lzfse via pip `lzfse`); mt6853.adt rebuilt WITH real /product node (12640B).
 
 **Only missing input for real XNU boot: the Mach-O kernel** (macOS CI workflow in place, or darwin-xnu-build on a Mac).
+
+## 2026-10-21: Entry-band panic + fix
+
+- Panic on-device: `ESR=0x96000021` = data abort, DFSC `0b100001` = **alignment fault**, stage `load`. `ELR=0x10148C4C4` = `ldr x16, .La` in `entryband.S` stub _A; `FAR=0x10148C4CC` = the `.La` literal at band+0x44 — 4-aligned only. With the MMU off, `ldr` literal requires natural alignment regardless of SCTLR.A. Fixed: `.balign 8` before `.La`/`.Lb`/`.Lc` (verified via objdump: literals now at band +0x48/+0xc0/+0x130; stub entry offsets 0x74/0xe8 unchanged).
+- **Source drift**: the band inside `out/xnu-payload.bin` is a NEWER variant (two fill loops + `mrs x9,vbar_el1` store to 0x1014c8c7f8 per stub, third stub returns via direct `b`) — not generated from the tree's `entryband.S`. Its literals are already aligned (band +0x70, +0x108); scanned the whole band, no remaining misaligned `ldr` literal. If the band source is regenerated, port the alignment fix + the new instrumentation into `entryband.S`.
+- `out/shim-boot.img` rebuilt 01:48 with the aligned-band payload (`xnu-payload.bin` == tail of `out/Image`, verified).
+
+## 2026-10-24: Post-mortem audit of the "frozen boot" image
+
+Root cause found  the kernel was blind, not dead:
+
+- **Patch 0082 was EMPTY** (wiped by "LF normalize 0082" in 97c008b). It
+  carried `fbcon_kick()`: DSI_START toggle after every fbcon character via
+  the `kick-reg` ADT prop. out4 built without it -> after `serial_init`
+  registers fbcon and `sweet_early_disable()` runs (arm_init.c:546), every
+  kprintf/panic writes to the OVL fb but never reaches the cmd-mode panel.
+  Screen freezes on the last early mark; indistinguishable from a hang.
+  Restored from git history (hash-verified), committed.
+- **0084 (new): UFS LUN scan.** `sweet_ufs.c` hard-coded `su.lun = 0`; on
+  MT6853 LUN0/1 are 4 MiB boot LUs and the GPT is on LUN2 -> `rd=ufsroot0`
+  could never find "userdata". Now scans LUNs 0-7 (still LUN0-first, so
+  sweet-compatible). Both patches verified with `git apply` against the
+  CI buildtree source.
+- Verified OK in shipped payload: entry band has DSI kicks + aligned
+  literals + vbar stores; early console path complete (0083 fb 0x77e20000,
+  early_dsi 0x14013000, two-block VA alias); ADT has kick-reg=0x14013000,
+  sweet-ufs reg=0x11270000, gicd/gicr, 13MHz, vtimer-intid 27, MPIDR i<<8;
+  vtimer INTID read from DT (SWEET.h 19 is only a fallback); persistent
+  log target is GPT-relative tail of the ufsroot partition (no fixed LBA).
+- Landmines (all boot-arg gated, add to cmdline): sweetkeys=0,
+  sweettouch=0, sweetusb=0  those drivers poke Qualcomm MMIO
+  (SPMI/GENI/RPMh 0x18220000) that does not exist on MT6853.
+- Next test cmdline suggestion:
+  `debug=0xc serial=3 cpus=1 keepsyms=1 -noprogress wdt=-1 sweetkeys=0 sweettouch=0 sweetusb=0 rd=ufsroot0`
