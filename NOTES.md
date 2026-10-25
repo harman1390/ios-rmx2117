@@ -193,3 +193,23 @@ Root cause found  the kernel was blind, not dead:
   (SPMI/GENI/RPMh 0x18220000) that does not exist on MT6853.
 - Next test cmdline suggestion:
   `debug=0xc serial=3 cpus=1 keepsyms=1 -noprogress wdt=-1 sweetkeys=0 sweettouch=0 sweetusb=0 rd=ufsroot0`
+
+## 2026-10-25: HFS root mount fixes (patch 0087)
+
+- `rootrw=1` vs `ufsrw=1`: 0031 cleared MNT_RDONLY on rootrw=1, but the UFS
+  driver (0030) refuses write opens unless ufsrw=1; the documented cmdline
+  had only rootrw=1, so the read-write HFS root mount failed (EROFS on the
+  device open / journal + volume-header writes). 0087 checks
+  DKIOCISWRITABLE and mounts read-only with a warning when the device is
+  not writable; BRINGUP cmdline now carries `rootrw=1 ufsrw=1`.
+- sweetlog overwrote the HFS partition alternate volume header (last 1 KiB
+  of the partition, rewritten by HFS on rw mount/flush) and vice versa.
+  Log area now ends one 4 KiB block before the partition end;
+  sweet-log-pull.sh reads from the new offset.
+- LUN scan: unit attention is per LU, and an EIO from a boot/absent LU
+  aborted the scan before LUN2. 0087 drains UA with TUR on every LU and
+  skips LUs that return EIO.
+- Flashing: `mtk.py w userdata` writes bytes as-is; flashing the
+  img2simg output put an Android sparse header where HFS expects its
+  volume header (offset 1024). Flash the raw .img with mtk.py; .simg is
+  for `fastboot flash` only.

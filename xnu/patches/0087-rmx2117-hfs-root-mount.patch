@@ -1,0 +1,76 @@
+diff --git a/bsd/dev/sweet_ufs.c b/bsd/dev/sweet_ufs.c
+index e83926b..20a8329 100644
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -649,8 +649,17 @@ sweet_ufs_init(void)
+ 		 * On sweet the GPT is on LUN0, which is tried first anyway.
+ 		 */
+ 		for (su.lun = 0; su.lun <= 7; su.lun++) {
++			/*
++			 * Unit attention is per LU: drain it on each LU before
++			 * reading its GPT, and treat a LU that still fails
++			 * (EIO: boot LU, absent LU) as "not here" rather than
++			 * aborting the scan before the GPT LU is reached.
++			 */
++			static const uint8_t lun_tur[6] = { 0x00 };
++			for (int i = 0; i < 3 && ufs_scsi(lun_tur, sizeof(lun_tur), 0, false); i++) {
++			}
+ 			error = ufs_find_partition(want);
+-			if (error == 0 || (error != ENXIO && error != ENOENT)) {
++			if (error == 0 || (error != ENXIO && error != ENOENT && error != EIO)) {
+ 				break;
+ 			}
+ 		}
+@@ -762,11 +771,16 @@ struct sweet_log_header {
+ static void
+ sweet_log_thread(__unused void *arg, __unused wait_result_t wr)
+ {
+-	uint64_t base = su.first_block + su.nblocks - SWEET_LOG_BLOCKS;
++	/*
++	 * Stop one block short of the partition end: HFS keeps its
++	 * partition alternate volume header in the last 1 KiB and
++	 * rewrites it on every read-write mount and volume-header flush.
++	 */
++	uint64_t base = su.first_block + su.nblocks - 1 - SWEET_LOG_BLOCKS;
+ 	uint64_t flushed = 0, seq = 0;
+ 	void *bounce = (void *)(su.dma + DMA_BOUNCE);
+ 
+-	printf("SWEET LOG: console log to the last %u KiB of the partition (block 0x%llx)\n",
++	printf("SWEET LOG: console log to %u KiB before the partition's last block (block 0x%llx)\n",
+ 	    SWEET_LOG_BLOCKS * UFS_BLOCK >> 10, base);
+ 	for (;;) {
+ 		(void)tsleep(&sweet_log_chan, PZERO, "sweetlog", hz * (int)sweet_log_secs);
+diff --git a/bsd/vfs/vfs_subr.c b/bsd/vfs/vfs_subr.c
+index b975a24..62c1ef5 100644
+--- a/bsd/vfs/vfs_subr.c
++++ b/bsd/vfs/vfs_subr.c
+@@ -82,6 +82,9 @@
+ #include <sys/proc_internal.h>
+ #include <sys/kauth.h>
+ #include <sys/mount_internal.h>
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/disk.h>
++#endif
+ #include <sys/time.h>
+ #include <sys/lock.h>
+ #include <sys/vnode.h>
+@@ -1265,7 +1268,18 @@ vfs_mountroot(void)
+ 		{
+ 			uint32_t rootrw = 0;
+ 			if (PE_parse_boot_argn("rootrw", &rootrw, sizeof(rootrw)) && rootrw) {
+-				mp->mnt_flag &= ~MNT_RDONLY;
++				/*
++				 * The block driver gates writes separately (ufsrw=1).
++				 * A read-write HFS mount of read-only media fails its
++				 * journal/volume-header writes, so fall back to a
++				 * read-only root instead of failing the mount.
++				 */
++				int writable = 0;
++				if (VNOP_IOCTL(rootvp, DKIOCISWRITABLE, (caddr_t)&writable, 0, ctx) == 0 && !writable) {
++					printf("vfs_mountroot: rootrw=1 but root device is read-only (ufsrw=1 missing?); mounting root read-only\n");
++				} else {
++					mp->mnt_flag &= ~MNT_RDONLY;
++				}
+ 			}
+ 		}
+ #endif
