@@ -106,10 +106,13 @@ index 6928957..b6cd8c6 100644
  }
  
  void
-@@ -130,6 +144,8 @@ sweet_early_relocate(uint64_t base)
+@@ -130,6 +144,10 @@ sweet_early_relocate(uint64_t base)
  {
  	sweet_early_mark(8, "leaving bootstrap TTBR0");
- 	early_fb = (volatile uint32_t *)(uintptr_t)base;
+-	early_fb = (volatile uint32_t *)(uintptr_t)base;
++	/* rmx2117 L1 fb sits at 0x78816000, i.e. block base + 0x16000; the
++	 * mapped VA is 32MB-aligned to the block, so add the in-block offset. */
++	early_fb = (volatile uint32_t *)(uintptr_t)(base + 0x16000);
 +	/* The dsi alias is the next 32MB block after the fb alias. */
 +	early_dsi = (volatile uint32_t *)(uintptr_t)(base + 0x2000000 + 0x13000);
  	__asm__ volatile("dsb sy" ::: "memory");
