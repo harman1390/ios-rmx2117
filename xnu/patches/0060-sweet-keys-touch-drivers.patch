@@ -260,7 +260,7 @@
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 --- /dev/null
 +++ b/bsd/dev/sweet_touch.c
-@@ -0,0 +1,756 @@
+@@ -0,0 +1,755 @@
 +/*
 + * SWEET MT6853 SPI4 / Novatek NT36672C (oplus tp_noflash) touch bring-up.
 + * RMX2117 wiring from the stock DTBO: spi4@11018000, irq GPIO14, reset
@@ -946,10 +946,9 @@
 +	twr(st.tl, 0x0070, trd(st.tl, 0x0070) | (1u << 2));  /* GPIO14 PU */
 +	gpio_mode(TP_PIN_RST, 0);
 +	gpio_dir(TP_PIN_RST, true);
-+if (!) {
-+		goto out
++	if (!spi_config()) {
++		goto out;
 +	}
-+	spi_config();
 +
 +	/* hardware reset pulse (DTBO reset_active: GPIO43 output-high) */
 +	gpio_out(TP_PIN_RST, false);
