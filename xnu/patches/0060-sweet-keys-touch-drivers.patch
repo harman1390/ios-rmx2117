@@ -32,7 +32,7 @@
  
 --- /dev/null
 +++ b/bsd/dev/sweet_keys.c
-@@ -0,0 +1,239 @@
+@@ -0,0 +1,169 @@
 +/*
 + * SWEET keys for MediaTek MT6853 (RMX2117 / Narzo 30 Pro 5G).
 + *
@@ -45,12 +45,10 @@
 + * not always reflect them. This driver therefore:
 + *   1. enables the key EINTs (unmask + domain-enable + level-sensitive) and
 + *      polls EINT RAW_STA for their live level;
-+ *   2. still polls all GPIO DIN banks as a diagnostic / for vol-down;
-+ *   3. reads the MT6359 TOPSTATUS register over the already-live SPMI bus
-+ *      (0x10027000) for the PMIC power/home key bits.
++ *   2. still polls all GPIO DIN banks as a diagnostic / for vol-down.
 + *
-+ * sweet_hid_key indices: 0=power, 1=vol-up, 2=vol-down. Home maps to power
-+ * for now (no dedicated home action in iOS).
++ * sweet_hid_key indices: 0=power, 1=vol-up, 2=vol-down. Power/home (PMIC
++ * SPMI) are deferred until the exact slave-id is confirmed.
 + */
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
 +#include <sys/param.h>
@@ -67,7 +65,6 @@
 +
 +#define KEYS_GPIO_PA        0x10005000u
 +#define KEYS_EINT_PA        0x1000b000u
-+#define KEYS_SPMI_PA        0x10027000u
 +
 +/* MT6853 GPIO DIN: bank n register at 0x0200 + n*0x10, one bit per pin. */
 +#define KEYS_DIN_OFF(pin)   (0x0200u + ((pin) / 32u) * 0x10u)
@@ -83,23 +80,6 @@
 +#define EINT_DOM_EN         0x400
 +#define EINT_RAW_STA        0xa00
 +
-+/* PMIF/SPMI software channel 0 registers (base 0x10027000). */
-+#define SPMI_ACC            0xc00
-+#define SPMI_WDATA          0xc04
-+#define SPMI_RDATA          0xc14
-+#define SPMI_VLD_CLR        0xc24
-+#define SPMI_STA            0xc28
-+#define SPMI_FSM(sta)       (((sta) >> 1) & 0x7u)
-+#define SPMI_FSM_IDLE       0x0u
-+#define SPMI_FSM_WFVLD      0x6u
-+#define PMIF_CMD_EXT_REG_LONG 3u
-+
-+/* MT6359 TOPSTATUS (PMIC reg 0x2a): bit1=pwrkey, bit3=homekey, active low. */
-+#define PMIC_TOPSTATUS      0x02au
-+#define PMIC_SID            0u
-+#define PMIC_PWRKEY         0x02u
-+#define PMIC_HOMEKEY        0x08u
-+
 +#define KEY_PWR             0
 +#define KEY_VOLUP           1
 +#define KEY_VOLDN           2
@@ -110,7 +90,6 @@
 +
 +static vm_offset_t keys_gpio;
 +static vm_offset_t keys_eint;
-+static vm_offset_t keys_spmi;
 +static bool keys_started;
 +static int keys_sleep_chan;
 +
@@ -144,43 +123,11 @@
 +	return (v >> (e & 31u)) & 1u;
 +}
 +
-+/* Wait for the SPMI software channel FSM to reach a state, bounded. */
-+static int
-+spmi_wait_state(uint32_t want)
-+{
-+	for (int i = 0; i < 200000; ++i) {
-+		if (SPMI_FSM(*(volatile uint32_t *)(keys_spmi + SPMI_STA)) == want)
-+			return 0;
-+		delay(1);
-+	}
-+	return -1;
-+}
-+
-+/* One SPMI extended-register read of `addr` on slave `sid` (already-init bus). */
-+static int
-+pmic_read(uint16_t addr, uint32_t *out)
-+{
-+	if (!keys_spmi)
-+		return -1;
-+	if (spmi_wait_state(SPMI_FSM_IDLE))
-+		return -2;
-+	*(volatile uint32_t *)(keys_spmi + SPMI_ACC) =
-+	    (PMIF_CMD_EXT_REG_LONG << 30) | (0u << 29) | (PMIC_SID << 24) |
-+	    (1u << 16) | addr;
-+	__asm__ volatile("dsb sy" ::: "memory");
-+	if (spmi_wait_state(SPMI_FSM_WFVLD))
-+		return -3;
-+	*out = *(volatile uint32_t *)(keys_spmi + SPMI_RDATA);
-+	*(volatile uint32_t *)(keys_spmi + SPMI_VLD_CLR) = 1;
-+	__asm__ volatile("dsb sy" ::: "memory");
-+	return 0;
-+}
-+
 +static void
 +keys_thread(void *arg, wait_result_t result)
 +{
 +	uint32_t prev[7] = {0};
-+	int up = 0, dn = 0, pwr = 0, home = 0;
++	int up = 0, dn = 0;
 +	(void)arg;
 +	(void)result;
 +	for (int b = 0; b < 7; ++b)
@@ -217,21 +164,7 @@
 +			if (e80 != dn) {
 +				dn = e80;
 +				printf("KEYEINT voldn eint80=%d\n", e80);
-+			}
-+		}
-+		/* PMIC TOPSTATUS: power + home keys live on the PMIC, not SoC GPIO. */
-+		uint32_t t;
-+		if (pmic_read(PMIC_TOPSTATUS, &t) == 0) {
-+			int p = !(t & PMIC_PWRKEY);
-+			int h = !(t & PMIC_HOMEKEY);
-+			if (p != pwr) {
-+				pwr = p;
-+				printf("KEYPMIC pwrkey=%d topstatus=%#x\n", p, t);
-+				sweet_hid_key(KEY_PWR, p);
-+			}
-+			if (h != home) {
-+				home = h;
-+				printf("KEYPMIC homekey=%d topstatus=%#x\n", h, t);
++				sweet_hid_key(KEY_VOLDN, !e80);
 +			}
 +		}
 +		keys_wait();
@@ -260,10 +193,7 @@
 +	keys_eint = ml_io_map(KEYS_EINT_PA, 0x1000);
 +	if (!keys_eint)
 +		printf("SWEET KEYS: EINT map failed\n");
-+	keys_spmi = ml_io_map(KEYS_SPMI_PA, 0x2000);
-+	if (!keys_spmi)
-+		printf("SWEET KEYS: SPMI map failed (no power/home key)\n");
-+	printf("SWEET KEYS: real config volup=EINT1/GPIO1 voldn=EINT80/GPIO80 pwr/home=PMIC topstatus\n");
++	printf("SWEET KEYS: real config volup=EINT1 voldn=EINT80 (eint+din poll)\n");
 +	kern_return_t kr = kernel_thread_start(keys_thread, NULL, &thread);
 +	if (kr == KERN_SUCCESS) {
 +		thread_deallocate(thread);
