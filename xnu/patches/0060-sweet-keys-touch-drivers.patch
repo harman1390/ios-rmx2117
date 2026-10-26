@@ -32,7 +32,7 @@
  
 --- /dev/null
 +++ b/bsd/dev/sweet_keys.c
-@@ -0,0 +1,108 @@
+@@ -0,0 +1,138 @@
 +/*
 + * Minimal polled SWEET keys for MediaTek MT6853 (RMX2117 / Narzo 30 Pro 5G).
 + * Reads the key GPIOs straight from the SoC GPIO DIN registers: DIN always
@@ -80,6 +80,19 @@
 +	return !(v & KEYS_DIN_BIT(pin)); /* active-low: 0 = pressed */
 +}
 +
++/* Force a pin to GPIO function (mode 0) + input so DIN reflects the pad.
++ * MODE regs: 8 pins/reg at 0x0300 + bank*0x10, 4 bits/pin.
++ * DIR  regs: 32 pins/reg at 0x0000 + bank*0x10, 1 bit/pin (0=input). */
++static void
++keys_cfg_input(unsigned pin)
++{
++	volatile uint32_t *mode = (volatile uint32_t *)(keys_gpio + 0x0300 + (pin / 8u) * 0x10u);
++	volatile uint32_t *dir  = (volatile uint32_t *)(keys_gpio + 0x0000 + (pin / 32u) * 0x10u);
++	*mode &= ~(0xFu << ((pin & 7u) * 4u));
++	*dir  &= ~(1u << (pin & 31u));
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
 +static void
 +keys_wait(void)
 +{
@@ -111,7 +124,11 @@
 +				int lvl = (int)((v >> bit) & 1u);
 +				printf("KEYSCAN pin=%u %s\n", pin, lvl ? "hi" : "lo");
 +				ch &= ch - 1;
-+				if (pin == PIN_VOLDN)
++				if (pin == PIN_PWR)
++					sweet_hid_key(KEY_PWR, !lvl);
++				else if (pin == PIN_VOLUP)
++					sweet_hid_key(KEY_VOLUP, !lvl);
++				else if (pin == PIN_VOLDN)
 +					sweet_hid_key(KEY_VOLDN, !lvl);
 +			}
 +		}
@@ -138,6 +155,10 @@
 +		printf("SWEET KEYS: GPIO MMIO map failed\n");
 +		return;
 +	}
++	/* Suspected key pins may be muxed to EINT/TP/other funcs; force them to
++	 * GPIO-input so DIN reads the pad level. */
++	keys_cfg_input(PIN_PWR);
++	keys_cfg_input(PIN_VOLUP);
 +	printf("SWEET KEYS: gpio=%p din0=%#x din2=%#x (pwr pin0, vol+ pin1, vol- pin80)\n",
 +	    (void *)keys_gpio,
 +	    *(volatile uint32_t *)(keys_gpio + KEYS_DIN_OFF(0)),
