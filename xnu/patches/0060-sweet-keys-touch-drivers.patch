@@ -32,7 +32,7 @@
  
 --- /dev/null
 +++ b/bsd/dev/sweet_keys.c
-@@ -0,0 +1,138 @@
+@@ -0,0 +1,169 @@
 +/*
 + * Minimal polled SWEET keys for MediaTek MT6853 (RMX2117 / Narzo 30 Pro 5G).
 + * Reads the key GPIOs straight from the SoC GPIO DIN registers: DIN always
@@ -56,6 +56,7 @@
 +void sweet_keys_init(void);
 +
 +#define KEYS_GPIO_PA        0x10005000u
++#define KEYS_EINT_PA        0x1000b000u
 +/* MT6853 GPIO DIN: bank n register at 0x0200 + n*0x10, one bit per pin. */
 +#define KEYS_DIN_OFF(pin)   (0x0200u + ((pin) / 32u) * 0x10u)
 +#define KEYS_DIN_BIT(pin)   (1u << ((pin) & 31u))
@@ -107,12 +108,23 @@
 +{
 +	/* KEYSCAN: poll every DIN bank and report each pin that toggles, so the
 +	 * real vol-up/power GPIOs reveal themselves on screen/log. Vol-down on
-+	 * pin80 still reports as a key so input isn't fully dead. */
++	 * pin80 still reports as a key so input isn't fully dead.
++	 * EINTSCAN: also poll the EINT status banks (0x1000b000 apirq). Key pins
++	 * muxed to EINT don't reflect in GPIO DIN, so they never showed in the
++	 * DIN scan. EINT raw/stat banks reveal which EINT index fires on press. */
 +	uint32_t prev[7] = {0};
++	uint32_t eraw[8] = {0};
++	uint32_t esta[8] = {0};
 +	(void)arg;
 +	(void)result;
 +	for (int b = 0; b < 7; ++b)
 +		prev[b] = *(volatile uint32_t *)(keys_gpio + 0x0200 + b * 0x10);
++	if (keys_eint) {
++		for (int b = 0; b < 8; ++b) {
++			eraw[b] = *(volatile uint32_t *)(keys_eint + 0xA00 + b * 4);
++			esta[b] = *(volatile uint32_t *)(keys_eint + 0x000 + b * 4);
++		}
++	}
 +	for (;;) {
 +		for (int b = 0; b < 7; ++b) {
 +			uint32_t v = *(volatile uint32_t *)(keys_gpio + 0x0200 + b * 0x10);
@@ -124,12 +136,28 @@
 +				int lvl = (int)((v >> bit) & 1u);
 +				printf("KEYSCAN pin=%u %s\n", pin, lvl ? "hi" : "lo");
 +				ch &= ch - 1;
-+				if (pin == PIN_PWR)
-+					sweet_hid_key(KEY_PWR, !lvl);
-+				else if (pin == PIN_VOLUP)
-+					sweet_hid_key(KEY_VOLUP, !lvl);
-+				else if (pin == PIN_VOLDN)
++				if (pin == PIN_VOLDN)
 +					sweet_hid_key(KEY_VOLDN, !lvl);
++			}
++		}
++		if (keys_eint) {
++			for (int b = 0; b < 8; ++b) {
++				uint32_t rv = *(volatile uint32_t *)(keys_eint + 0xA00 + b * 4);
++				uint32_t rch = rv ^ eraw[b];
++				eraw[b] = rv;
++				while (rch) {
++					unsigned bit = __builtin_ctz(rch);
++					printf("EINTR eint=%u %s\n", b * 32u + bit, ((rv >> bit) & 1u) ? "hi" : "lo");
++					rch &= rch - 1;
++				}
++				uint32_t sv = *(volatile uint32_t *)(keys_eint + 0x000 + b * 4);
++				uint32_t sch = sv ^ esta[b];
++				esta[b] = sv;
++				while (sch) {
++					unsigned bit = __builtin_ctz(sch);
++					printf("EINTS eint=%u %s\n", b * 32u + bit, ((sv >> bit) & 1u) ? "hi" : "lo");
++					sch &= sch - 1;
++				}
 +			}
 +		}
 +		keys_wait();
@@ -155,6 +183,9 @@
 +		printf("SWEET KEYS: GPIO MMIO map failed\n");
 +		return;
 +	}
++	keys_eint = ml_io_map(KEYS_EINT_PA, 0x1000);
++	if (!keys_eint)
++		printf("SWEET KEYS: EINT map failed\n");
 +	/* Suspected key pins may be muxed to EINT/TP/other funcs; force them to
 +	 * GPIO-input so DIN reads the pad level. */
 +	keys_cfg_input(PIN_PWR);
