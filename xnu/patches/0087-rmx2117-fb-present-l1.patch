@@ -1,0 +1,24 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 0000000..0000000 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -162,6 +162,19 @@
+ 	fWidth = (uint32_t)video.v_width;
+ 	fHeight = (uint32_t)video.v_height;
+ 	fRowBytes = (uint32_t)video.v_rowBytes;
++	/* rmx2117: the DSI cmd-mode panel scans only OVL layer 1, phys
++	 * 0x78816000 @ 4320 pitch; L0 (0x77e20000) is never composited.
++	 * Present the GUI into L1's buffer so it reaches the panel. L0
++	 * stays the kernel's reserved boot fb -- the OVL DMA-scanning
++	 * *that* buffer early-faults the kernel, so keep them distinct.
++	 * (boot-arg sweetfb_l0=1 reverts to the L0 fb for debugging.)
++	 */
++	int useL0 = 0;
++	PE_parse_boot_argn("sweetfb_l0", &useL0, sizeof(useL0));
++	if (!useL0) {
++		fPhys = 0x78816000ULL;
++		fRowBytes = 4320;
++	}
+ 	if (fPhys == 0 || fWidth == 0 || fHeight == 0 || fRowBytes < fWidth * 4) {
+ 		IOLog("SWEET FB: no boot framebuffer\n");
+ 		return false;
