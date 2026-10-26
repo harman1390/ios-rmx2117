@@ -92,18 +92,27 @@
 +static void
 +keys_thread(void *arg, wait_result_t result)
 +{
-+	static const unsigned pins[3] = { PIN_PWR, PIN_VOLUP, PIN_VOLDN };
-+	int state[3] = {0, 0, 0};
++	/* KEYSCAN: poll every DIN bank and report each pin that toggles, so the
++	 * real vol-up/power GPIOs reveal themselves on screen/log. Vol-down on
++	 * pin80 still reports as a key so input isn't fully dead. */
++	uint32_t prev[7] = {0};
 +	(void)arg;
 +	(void)result;
++	for (int b = 0; b < 7; ++b)
++		prev[b] = *(volatile uint32_t *)(keys_gpio + 0x0200 + b * 0x10);
 +	for (;;) {
-+		for (int k = 0; k < 3; ++k) {
-+			int now = key_pressed(pins[k]);
-+			if (now != state[k]) {
-+				state[k] = now;
-+				printf("SWEET KEYS: key=%d pin=%u %s\n",
-+				    k, pins[k], now ? "down" : "up");
-+				sweet_hid_key(k, now);
++		for (int b = 0; b < 7; ++b) {
++			uint32_t v = *(volatile uint32_t *)(keys_gpio + 0x0200 + b * 0x10);
++			uint32_t ch = v ^ prev[b];
++			prev[b] = v;
++			while (ch) {
++				unsigned bit = __builtin_ctz(ch);
++				unsigned pin = (unsigned)b * 32u + bit;
++				int lvl = (int)((v >> bit) & 1u);
++				printf("KEYSCAN pin=%u %s\n", pin, lvl ? "hi" : "lo");
++				ch &= ch - 1;
++				if (pin == PIN_VOLDN)
++					sweet_hid_key(KEY_VOLDN, !lvl);
 +			}
 +		}
 +		keys_wait();
