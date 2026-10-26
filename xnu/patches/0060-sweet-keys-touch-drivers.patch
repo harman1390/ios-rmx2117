@@ -32,7 +32,7 @@
  
 --- /dev/null
 +++ b/bsd/dev/sweet_keys.c
-@@ -0,0 +1,169 @@
+@@ -0,0 +1,170 @@
 +/*
 + * Minimal polled SWEET keys for MediaTek MT6853 (RMX2117 / Narzo 30 Pro 5G).
 + * Reads the key GPIOs straight from the SoC GPIO DIN registers: DIN always
@@ -70,6 +70,7 @@
 +#define PIN_VOLDN           80u
 +
 +static vm_offset_t keys_gpio;
++static vm_offset_t keys_eint;
 +static bool keys_started;
 +static int keys_sleep_chan;
 +
