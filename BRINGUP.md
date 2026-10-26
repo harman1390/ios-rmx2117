@@ -34,23 +34,25 @@ or push ios-rmx2117 to GitHub and run the `xnu` workflow.
     sudo fsck.hfsplus -fy ios16-root.img
     sudo mount -t hfsplus -o loop,force ios16-root.img /mnt/iosroot
     sudo python3 tools/sweet-root-tweaks.py /mnt/iosroot
-    sudo umount /mnt/iosroot; img2simg ios16-root.img ios16-root.simg
+    sudo umount /mnt/iosroot; img2simg ios16-root.img ios16-root.simg   # fastboot only
 
 ## 3. Boot image (Windows OK — aarch64-none-elf in tools_pkg)
 
     python tools/mkadt.py dtb/mt6853.adt --highmem       # already built
     python tools/mkpayload.py KERNEL dtb/mt6853.adt shim/out/payload.bin \
-      --cmdline 'debug=0xc serial=3 cpus=8 keepsyms=1 -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 wdt=-1 rootrw=1'
+      --cmdline 'debug=0xc serial=3 cpus=8 keepsyms=1 -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 wdt=-1 rootrw=1 ufsrw=1'
     cd shim; build.bat out\payload.bin   # -> out/shim-boot.img
 
 MT6853 deltas vs the sweet cmdline: `cpus=8` (2xA76+6xA55, all verified),
-`rd=ufsroot0` naming TBD by the UFS driver, DSI cmd-mode panel needs a
+`rd=ufsroot0` (GPT "userdata", found by the LUN scan; `rootrw=1` needs
+`ufsrw=1` or the root falls back to read-only, patch 0087), DSI cmd-mode panel needs a
 kick hook in the kernel fb path (shim precedent: DSI_START 0->1 @
 0x1401300C), MTK WDT at 0x10007000 (not Qualcomm IMEM).
 
 ## 4. Flash
 
-    python mtk.py w userdata ios16-root.simg   # or fastboot if unlocked
+    python mtk.py w userdata ios16-root.img    # raw image: mtk.py does not unsparse
+    # or, if unlocked: fastboot flash userdata ios16-root.simg
     python mtk.py w boot shim\out\shim-boot.img
     # or: fastboot boot shim\out\shim-boot.img
 
