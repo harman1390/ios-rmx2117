@@ -32,15 +32,25 @@
  
 --- /dev/null
 +++ b/bsd/dev/sweet_keys.c
-@@ -0,0 +1,170 @@
+@@ -0,0 +1,239 @@
 +/*
-+ * Minimal polled SWEET keys for MediaTek MT6853 (RMX2117 / Narzo 30 Pro 5G).
-+ * Reads the key GPIOs straight from the SoC GPIO DIN registers: DIN always
-+ * reflects the pad logic level, so no EINT or KPD programming is needed.
-+ * Keys are active-low: a pressed key pulls its line to ground so DIN reads 0.
-+ *   power     = GPIO0  (mediatek,kpd-pwrkey eint-gpio 0)
-+ *   volume-up = GPIO1  (EINT1,    keypad,volume-up)
-+ *   vol-down  = GPIO80 (EINT0x50, keypad,volume-down)
++ * SWEET keys for MediaTek MT6853 (RMX2117 / Narzo 30 Pro 5G).
++ *
++ * Real device config recovered from the board's dtbo overlay:
++ *   volume-down = GPIO80 / EINT80  (kpd_volume_down, VOLUME_DOWN-eint)
++ *   volume-up   = GPIO1  / EINT1   (kpd_volume_up,   VOLUME_UP-eint)
++ *   power/home  = MT6359 PMIC keys (pwrkey/homekey on mediatek,mt6359-pmic)
++ *
++ * The volume keys are declared as EINT keys, so a bare GPIO DIN poll does
++ * not always reflect them. This driver therefore:
++ *   1. enables the key EINTs (unmask + domain-enable + level-sensitive) and
++ *      polls EINT RAW_STA for their live level;
++ *   2. still polls all GPIO DIN banks as a diagnostic / for vol-down;
++ *   3. reads the MT6359 TOPSTATUS register over the already-live SPMI bus
++ *      (0x10027000) for the PMIC power/home key bits.
++ *
++ * sweet_hid_key indices: 0=power, 1=vol-up, 2=vol-down. Home maps to power
++ * for now (no dedicated home action in iOS).
 + */
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
 +#include <sys/param.h>
@@ -57,43 +67,52 @@
 +
 +#define KEYS_GPIO_PA        0x10005000u
 +#define KEYS_EINT_PA        0x1000b000u
++#define KEYS_SPMI_PA        0x10027000u
++
 +/* MT6853 GPIO DIN: bank n register at 0x0200 + n*0x10, one bit per pin. */
 +#define KEYS_DIN_OFF(pin)   (0x0200u + ((pin) / 32u) * 0x10u)
 +#define KEYS_DIN_BIT(pin)   (1u << ((pin) & 31u))
 +
-+#define KEY_PWR             0   /* sweet_hid_key index 0 = power  */
-+#define KEY_VOLUP           1   /* sweet_hid_key index 1 = vol up */
-+#define KEY_VOLDN           2   /* sweet_hid_key index 2 = vol dn */
++/* MT6853 EINT (apirq) register offsets; per-EINT bank register is at
++ * base + off + (eint/32)*4 and the bit index is eint%32. */
++#define EINT_STA            0x000
++#define EINT_MASK_CLR       0x100
++#define EINT_SENS_SET       0x180
++#define EINT_POL_SET        0x340
++#define EINT_POL_CLR        0x380
++#define EINT_DOM_EN         0x400
++#define EINT_RAW_STA        0xa00
 +
-+#define PIN_PWR             0u
-+#define PIN_VOLUP           1u
++/* PMIF/SPMI software channel 0 registers (base 0x10027000). */
++#define SPMI_ACC            0xc00
++#define SPMI_WDATA          0xc04
++#define SPMI_RDATA          0xc14
++#define SPMI_VLD_CLR        0xc24
++#define SPMI_STA            0xc28
++#define SPMI_FSM(sta)       (((sta) >> 1) & 0x7u)
++#define SPMI_FSM_IDLE       0x0u
++#define SPMI_FSM_WFVLD      0x6u
++#define PMIF_CMD_EXT_REG_LONG 3u
++
++/* MT6359 TOPSTATUS (PMIC reg 0x2a): bit1=pwrkey, bit3=homekey, active low. */
++#define PMIC_TOPSTATUS      0x02au
++#define PMIC_SID            0u
++#define PMIC_PWRKEY         0x02u
++#define PMIC_HOMEKEY        0x08u
++
++#define KEY_PWR             0
++#define KEY_VOLUP           1
++#define KEY_VOLDN           2
++
++#define EINT_VOLUP          1u
++#define EINT_VOLDN          80u
 +#define PIN_VOLDN           80u
 +
 +static vm_offset_t keys_gpio;
 +static vm_offset_t keys_eint;
++static vm_offset_t keys_spmi;
 +static bool keys_started;
 +static int keys_sleep_chan;
-+
-+static int
-+key_pressed(unsigned pin)
-+{
-+	uint32_t v = *(volatile uint32_t *)(keys_gpio + KEYS_DIN_OFF(pin));
-+	__asm__ volatile("dmb oshld" ::: "memory");
-+	return !(v & KEYS_DIN_BIT(pin)); /* active-low: 0 = pressed */
-+}
-+
-+/* Force a pin to GPIO function (mode 0) + input so DIN reflects the pad.
-+ * MODE regs: 8 pins/reg at 0x0300 + bank*0x10, 4 bits/pin.
-+ * DIR  regs: 32 pins/reg at 0x0000 + bank*0x10, 1 bit/pin (0=input). */
-+static void
-+keys_cfg_input(unsigned pin)
-+{
-+	volatile uint32_t *mode = (volatile uint32_t *)(keys_gpio + 0x0300 + (pin / 8u) * 0x10u);
-+	volatile uint32_t *dir  = (volatile uint32_t *)(keys_gpio + 0x0000 + (pin / 32u) * 0x10u);
-+	*mode &= ~(0xFu << ((pin & 7u) * 4u));
-+	*dir  &= ~(1u << (pin & 31u));
-+	__asm__ volatile("dsb sy" ::: "memory");
-+}
 +
 +static void
 +keys_wait(void)
@@ -104,29 +123,74 @@
 +	thread_block(THREAD_CONTINUE_NULL);
 +}
 +
++/* Enable one EINT line so its raw-status bit tracks the pin level.
++ * reg = base + off + (eint/32)*4 ; bit = 1 << (eint%32). */
++static void
++eint_enable(unsigned e)
++{
++	uint32_t bit = 1u << (e & 31u);
++	uint32_t bo = (e >> 5) * 4u;
++	*(volatile uint32_t *)(keys_eint + EINT_SENS_SET + bo) = bit; /* level sens */
++	*(volatile uint32_t *)(keys_eint + EINT_DOM_EN + bo) = bit;   /* domain en */
++	*(volatile uint32_t *)(keys_eint + EINT_MASK_CLR + bo) = bit; /* unmask */
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++static int
++eint_level(unsigned e)
++{
++	uint32_t v = *(volatile uint32_t *)(keys_eint + EINT_RAW_STA + (e >> 5) * 4u);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return (v >> (e & 31u)) & 1u;
++}
++
++/* Wait for the SPMI software channel FSM to reach a state, bounded. */
++static int
++spmi_wait_state(uint32_t want)
++{
++	for (int i = 0; i < 200000; ++i) {
++		if (SPMI_FSM(*(volatile uint32_t *)(keys_spmi + SPMI_STA)) == want)
++			return 0;
++		delay(1);
++	}
++	return -1;
++}
++
++/* One SPMI extended-register read of `addr` on slave `sid` (already-init bus). */
++static int
++pmic_read(uint16_t addr, uint32_t *out)
++{
++	if (!keys_spmi)
++		return -1;
++	if (spmi_wait_state(SPMI_FSM_IDLE))
++		return -2;
++	*(volatile uint32_t *)(keys_spmi + SPMI_ACC) =
++	    (PMIF_CMD_EXT_REG_LONG << 30) | (0u << 29) | (PMIC_SID << 24) |
++	    (1u << 16) | addr;
++	__asm__ volatile("dsb sy" ::: "memory");
++	if (spmi_wait_state(SPMI_FSM_WFVLD))
++		return -3;
++	*out = *(volatile uint32_t *)(keys_spmi + SPMI_RDATA);
++	*(volatile uint32_t *)(keys_spmi + SPMI_VLD_CLR) = 1;
++	__asm__ volatile("dsb sy" ::: "memory");
++	return 0;
++}
++
 +static void
 +keys_thread(void *arg, wait_result_t result)
 +{
-+	/* KEYSCAN: poll every DIN bank and report each pin that toggles, so the
-+	 * real vol-up/power GPIOs reveal themselves on screen/log. Vol-down on
-+	 * pin80 still reports as a key so input isn't fully dead.
-+	 * EINTSCAN: also poll the EINT status banks (0x1000b000 apirq). Key pins
-+	 * muxed to EINT don't reflect in GPIO DIN, so they never showed in the
-+	 * DIN scan. EINT raw/stat banks reveal which EINT index fires on press. */
 +	uint32_t prev[7] = {0};
-+	uint32_t eraw[8] = {0};
-+	uint32_t esta[8] = {0};
++	int up = 0, dn = 0, pwr = 0, home = 0;
 +	(void)arg;
 +	(void)result;
 +	for (int b = 0; b < 7; ++b)
 +		prev[b] = *(volatile uint32_t *)(keys_gpio + 0x0200 + b * 0x10);
 +	if (keys_eint) {
-+		for (int b = 0; b < 8; ++b) {
-+			eraw[b] = *(volatile uint32_t *)(keys_eint + 0xA00 + b * 4);
-+			esta[b] = *(volatile uint32_t *)(keys_eint + 0x000 + b * 4);
-+		}
++		eint_enable(EINT_VOLUP);
++		eint_enable(EINT_VOLDN);
 +	}
 +	for (;;) {
++		/* DIN scan still reports any toggling pin for diagnostics. */
 +		for (int b = 0; b < 7; ++b) {
 +			uint32_t v = *(volatile uint32_t *)(keys_gpio + 0x0200 + b * 0x10);
 +			uint32_t ch = v ^ prev[b];
@@ -141,24 +205,33 @@
 +					sweet_hid_key(KEY_VOLDN, !lvl);
 +			}
 +		}
++		/* EINT raw-status read for the confirmed key EINTs. */
 +		if (keys_eint) {
-+			for (int b = 0; b < 8; ++b) {
-+				uint32_t rv = *(volatile uint32_t *)(keys_eint + 0xA00 + b * 4);
-+				uint32_t rch = rv ^ eraw[b];
-+				eraw[b] = rv;
-+				while (rch) {
-+					unsigned bit = __builtin_ctz(rch);
-+					printf("EINTR eint=%u %s\n", b * 32u + bit, ((rv >> bit) & 1u) ? "hi" : "lo");
-+					rch &= rch - 1;
-+				}
-+				uint32_t sv = *(volatile uint32_t *)(keys_eint + 0x000 + b * 4);
-+				uint32_t sch = sv ^ esta[b];
-+				esta[b] = sv;
-+				while (sch) {
-+					unsigned bit = __builtin_ctz(sch);
-+					printf("EINTS eint=%u %s\n", b * 32u + bit, ((sv >> bit) & 1u) ? "hi" : "lo");
-+					sch &= sch - 1;
-+				}
++			int e1 = eint_level(EINT_VOLUP);
++			int e80 = eint_level(EINT_VOLDN);
++			if (e1 != up) {
++				up = e1;
++				printf("KEYEINT volup eint1=%d\n", e1);
++				sweet_hid_key(KEY_VOLUP, !e1);
++			}
++			if (e80 != dn) {
++				dn = e80;
++				printf("KEYEINT voldn eint80=%d\n", e80);
++			}
++		}
++		/* PMIC TOPSTATUS: power + home keys live on the PMIC, not SoC GPIO. */
++		uint32_t t;
++		if (pmic_read(PMIC_TOPSTATUS, &t) == 0) {
++			int p = !(t & PMIC_PWRKEY);
++			int h = !(t & PMIC_HOMEKEY);
++			if (p != pwr) {
++				pwr = p;
++				printf("KEYPMIC pwrkey=%d topstatus=%#x\n", p, t);
++				sweet_hid_key(KEY_PWR, p);
++			}
++			if (h != home) {
++				home = h;
++				printf("KEYPMIC homekey=%d topstatus=%#x\n", h, t);
 +			}
 +		}
 +		keys_wait();
@@ -187,14 +260,10 @@
 +	keys_eint = ml_io_map(KEYS_EINT_PA, 0x1000);
 +	if (!keys_eint)
 +		printf("SWEET KEYS: EINT map failed\n");
-+	/* Suspected key pins may be muxed to EINT/TP/other funcs; force them to
-+	 * GPIO-input so DIN reads the pad level. */
-+	keys_cfg_input(PIN_PWR);
-+	keys_cfg_input(PIN_VOLUP);
-+	printf("SWEET KEYS: gpio=%p din0=%#x din2=%#x (pwr pin0, vol+ pin1, vol- pin80)\n",
-+	    (void *)keys_gpio,
-+	    *(volatile uint32_t *)(keys_gpio + KEYS_DIN_OFF(0)),
-+	    *(volatile uint32_t *)(keys_gpio + KEYS_DIN_OFF(80)));
++	keys_spmi = ml_io_map(KEYS_SPMI_PA, 0x2000);
++	if (!keys_spmi)
++		printf("SWEET KEYS: SPMI map failed (no power/home key)\n");
++	printf("SWEET KEYS: real config volup=EINT1/GPIO1 voldn=EINT80/GPIO80 pwr/home=PMIC topstatus\n");
 +	kern_return_t kr = kernel_thread_start(keys_thread, NULL, &thread);
 +	if (kr == KERN_SUCCESS) {
 +		thread_deallocate(thread);
