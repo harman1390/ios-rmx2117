@@ -260,7 +260,7 @@
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 --- /dev/null
 +++ b/bsd/dev/sweet_touch.c
-@@ -0,0 +1,755 @@
+@@ -0,0 +1,784 @@
 +/*
 + * SWEET MT6853 SPI4 / Novatek NT36672C (oplus tp_noflash) touch bring-up.
 + * RMX2117 wiring from the stock DTBO: spi4@11018000, irq GPIO14, reset
@@ -336,7 +336,8 @@
 +#define TP_PIN_CLK      97u   /* SPI4_CLK */
 +#define TP_PIN_CSB      98u   /* SPI4_CSB -> used as manual CS GPIO */
 +#define TP_PIN_IRQ      14u
-+#define TP_PIN_RST      43u
++#define TP_PIN_RST      43u   /* DTBO fragment@22 */
++#define TP_PIN_RST2     33u   /* DTBO fragment@30 variant */
 +
 +/* --- NT36672C constants (NT36675 mmap) ------------------------------- */
 +#define NVT_EVENT_BUF   0x22D00u
@@ -371,7 +372,7 @@
 +
 +static struct {
 +	vm_offset_t spi, gpio, infra, lm, bm, tl;
-+	bool started, dead, have_nvt;
++	bool started, dead, have_nvt, hw_cs;
 +	uint32_t active;
 +	int x[TP_TOUCH_MAX], y[TP_TOUCH_MAX];
 +} st;
@@ -463,11 +464,13 @@
 +	return true;
 +}
 +
-+/* manual CS on GPIO98 */
++/* CS control: manual GPIO98, or hardware CSB when st.hw_cs */
 +static void
 +tp_cs(bool low)
 +{
-+	gpio_out(TP_PIN_CSB, !low);
++	if (!st.hw_cs) {
++		gpio_out(TP_PIN_CSB, !low);
++	}
 +	if (low) {
 +		twr(st.spi, SPI_CMD, trd(st.spi, SPI_CMD) & ~SPI_PAUSE_EN);
 +	} else {
@@ -908,11 +911,28 @@
 +	return 0;
 +}
 +
++/* pulse reset on `pin`, then run the NVT chip-id probe */
++static bool
++nvt_reset_and_detect(unsigned pin, uint8_t id[6])
++{
++	gpio_mode(pin, 0);
++	gpio_dir(pin, true);
++	gpio_out(pin, false);
++	twait(10);
++	gpio_out(pin, true);
++	twait(60);
++	nvt_eng_reset();
++	gpio_out(pin, true);
++	printf("SWEET TOUCH: din after rst%u: irq=%d r33=%d r43=%d csb=%d\n",
++	    pin, gpio_in(TP_PIN_IRQ), gpio_in(33), gpio_in(43), gpio_in(TP_PIN_CSB));
++	return nvt_detect(id);
++}
++
 +/* --- init + poll thread ---------------------------------------------- */
 +static void
 +touch_thread(void *arg, wait_result_t result)
 +{
-+	unsigned delay_s = 45;
++	unsigned delay_s = 15;
 +	uint8_t id[6] = {0};
 +	(void)arg;
 +	(void)result;
@@ -931,7 +951,7 @@
 +		goto out;
 +	}
 +
-+	/* pinmux: SPI4 pins f2 (CSB stays GPIO for manual CS), irq input, rst out */
++	/* pinmux: SPI4 pins f2; CSB is GPIO unless hw_cs fallback kicks in */
 +	gpio_mode(TP_PIN_MI, 2);
 +	gpio_mode(TP_PIN_MO, 2);
 +	gpio_mode(TP_PIN_CLK, 2);
@@ -944,21 +964,28 @@
 +	twr(st.lm, 0x0050, trd(st.lm, 0x0050) | (1u << 10)); /* GPIO12 IES */
 +	twr(st.tl, 0x0040, trd(st.tl, 0x0040) | (1u << 2));  /* GPIO14 IES */
 +	twr(st.tl, 0x0070, trd(st.tl, 0x0070) | (1u << 2));  /* GPIO14 PU */
-+	gpio_mode(TP_PIN_RST, 0);
-+	gpio_dir(TP_PIN_RST, true);
++
 +	if (!spi_config()) {
 +		goto out;
 +	}
++	printf("SWEET TOUCH: din at start: irq=%d r33=%d r43=%d csb=%d mi=%d\n",
++	    gpio_in(TP_PIN_IRQ), gpio_in(33), gpio_in(43),
++	    gpio_in(TP_PIN_CSB), gpio_in(TP_PIN_MI));
 +
-+	/* hardware reset pulse (DTBO reset_active: GPIO43 output-high) */
-+	gpio_out(TP_PIN_RST, false);
-+	twait(10);
-+	gpio_out(TP_PIN_RST, true);
-+	twait(60);
-+	nvt_eng_reset();
-+	gpio_out(TP_PIN_RST, true);
-+
-+	if (!nvt_detect(id)) {
++	/* two DTBO overlays disagree on the reset pin: try 43 then 33 */
++	bool detected = nvt_reset_and_detect(TP_PIN_RST, id);
++	if (!detected) {
++		printf("SWEET TOUCH: retrying with reset GPIO33\n");
++		detected = nvt_reset_and_detect(TP_PIN_RST2, id);
++	}
++	if (!detected) {
++		/* last resort: let the hardware drive CSB itself */
++		printf("SWEET TOUCH: retrying with hardware CSB\n");
++		st.hw_cs = true;
++		gpio_mode(TP_PIN_CSB, 2);
++		detected = nvt_reset_and_detect(TP_PIN_RST, id);
++	}
++	if (!detected) {
 +		printf("SWEET TOUCH: no NT36672C id (%02x %02x %02x %02x %02x %02x); "
 +		    "panel may be Himax HX83112F -- not supported yet\n",
 +		    id[0], id[1], id[2], id[3], id[4], id[5]);
@@ -977,14 +1004,16 @@
 +	nvt_fwinfo();
 +	printf("SWEET TOUCH: running (1080x2400, irq=gpio14, poll=8ms)\n");
 +
-+	unsigned recoveries = 0;
++	unsigned recoveries = 0, tick = 0;
 +	while (!st.dead) {
-+		if (!gpio_in(TP_PIN_IRQ) || st.active) {
-+			int err = nvt_points();
-+			if (err == EAGAIN && recoveries++ < 3) {
-+				printf("SWEET TOUCH: nvt recovery frame; re-downloading fw\n");
-+				(void)nvt_download(sweet_nvt_fw, sweet_nvt_fw_size);
-+			}
++		int err = nvt_points();
++		if (err == EAGAIN && recoveries++ < 3) {
++			printf("SWEET TOUCH: nvt recovery frame; re-downloading fw\n");
++			(void)nvt_download(sweet_nvt_fw, sweet_nvt_fw_size);
++		}
++		if ((++tick % 625u) == 0) {
++			printf("SWEET TOUCH: alive irq=%d act=%#x err=%d\n",
++			    gpio_in(TP_PIN_IRQ), st.active, err);
 +		}
 +		twait(8);
 +	}
