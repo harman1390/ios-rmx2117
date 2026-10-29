@@ -292,7 +292,7 @@
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 --- /dev/null
 +++ b/bsd/dev/sweet_touch.c
-@@ -0,0 +1,935 @@
+@@ -0,0 +1,951 @@
 +/*
 + * SWEET MT6853 SPI4 / Novatek NT36672C (oplus tp_noflash) touch bring-up.
 + * RMX2117 wiring from the stock DTBO: spi4@11018000, irq GPIO14, reset
@@ -350,9 +350,9 @@
 +#define SPI_RXMSBF      (1u << 13)
 +#define SPI_FINISH_IE   (1u << 16)
 +#define SPI_PAUSE_IE    (1u << 17)
-+/* ST0 bit1 = pause-int; ST1 bit0 = finish-int (vendor spi-mt65xx) */
++/* ST0: bit0 = finish-int, bit1 = pause-int (vendor spi-mt65xx irq) */
++#define SPI_ST0_FINISH  1u
 +#define SPI_ST0_PAUSE   2u
-+#define SPI_ST1_FINISH  1u
 +
 +#define SPI_FIFO        32u
 +
@@ -370,15 +370,24 @@
 +#define TP_PIN_IRQ      14u
 +#define TP_PIN_RST      43u   /* DTBO fragment@22 */
 +#define TP_PIN_RST2     33u   /* DTBO fragment@30 variant */
-+
-+/* --- MT6360 sub-PMIC on i2c5: "vtouch"/VTP LDO2 feeds the NT36672C ---- */
-+#define TP_I2C5_PA      0x11d00000u /* i2c5 controller */
 +#define TP_PIN_SCL      107u        /* SCL5 */
 +#define TP_PIN_SDA      108u        /* SDA5 */
 +#define TP_I2C_FUNC     1u
++
++/* --- MT6360 sub-PMIC on i2c5: "vtouch"/VTP LDO2 feeds the NT36672C ---- */
++#define TP_I2C5_PA      0x11d00000u /* i2c5 controller */
 +#define MT6360_ADDR     0x64u       /* subpmic_ldo, i2c-5 slave 0x64 */
 +#define MT6360_LDO2_EN  0x11u       /* EN_CTRL2: bit6 enables LDO2 */
 +#define MT6360_LDO2_VSEL 0x15u      /* CTRL3: 0x3d = 1.8 V (flat range) */
++
++/* topckgen spi_sel mux (clk-mt6853): CLK_CFG_6 bits[17:16], upd bit26 */
++#define TP_TOPCK_PA     0x10000000u
++#define TP_CLK_CFG6     0x070u
++#define TP_CLK_CFG6_SET 0x074u
++#define TP_CLK_CFG6_CLR 0x078u
++#define TP_CLK_CFG_UPD  0x004u
++#define TP_SPI_SEL_LSB  16u
++#define TP_MUX_SPI_UPD  (1u << 26)
 +
 +/* --- NT36672C constants (NT36675 mmap) ------------------------------- */
 +#define NVT_EVENT_BUF   0x22D00u
@@ -412,7 +421,7 @@
 +extern const unsigned int sweet_nvt_fw_size;
 +
 +static struct {
-+	vm_offset_t spi, gpio, infra, lm, bm, tl, i2c;
++	vm_offset_t spi, gpio, infra, lm, bm, tl, i2c, topck;
 +	bool started, dead, have_nvt, hw_cs;
 +	uint32_t active;
 +	int x[TP_TOUCH_MAX], y[TP_TOUCH_MAX];
@@ -606,6 +615,16 @@
 +static bool
 +spi_config(void)
 +{
++	/* spi_sel mux -> index0 (26M xtal, always-on); log old src first */
++	uint32_t cfg6 = trd(st.topck, TP_CLK_CFG6);
++	printf("SWEET TOUCH: spi_sel mux cfg6=%#x (idx=%u)\n",
++	    cfg6, (cfg6 >> TP_SPI_SEL_LSB) & 3u);
++	twr(st.topck, TP_CLK_CFG6_CLR, 3u << TP_SPI_SEL_LSB);
++	twr(st.topck, TP_CLK_CFG6_SET, 0u << TP_SPI_SEL_LSB);
++	twr(st.topck, TP_CLK_CFG_UPD, TP_MUX_SPI_UPD);
++	printf("SWEET TOUCH: spi_sel mux now=%#x\n",
++	    trd(st.topck, TP_CLK_CFG6));
++
 +	/* ungate SPI4 bus clock (IFRAO4 bit25) */
 +	twr(st.infra, TP_SPI4_CG_CLR, TP_SPI4_CG_BIT);
 +	uint32_t sta = trd(st.infra, TP_SPI4_CG_STA);
@@ -654,13 +673,10 @@
 +{
 +	uint32_t s;
 +	for (unsigned i = 0; i < 40000; ++i) {
-+		/* finish int-status is ST1 bit0; ST0 bit1 is pause-int */
-+		s = trd(st.spi, SPI_ST1);
-+		if (s & SPI_ST1_FINISH) {
-+			twr(st.spi, SPI_ST1, s); /* w1c */
++		s = trd(st.spi, SPI_ST0);
++		if (s & SPI_ST0_FINISH) {
 +			return true;
 +		}
-+		s = trd(st.spi, SPI_ST0);
 +		if (s & SPI_ST0_PAUSE) {
 +			/* unexpected mid-transfer pause; keep it moving */
 +			twr(st.spi, SPI_CMD, trd(st.spi, SPI_CMD) | SPI_RESUME);
@@ -707,11 +723,10 @@
 +			twr(st.spi, SPI_TXD, v);
 +		}
 +		twr(st.spi, SPI_ST0, trd(st.spi, SPI_ST0)); /* w1c */
-+		twr(st.spi, SPI_ST1, trd(st.spi, SPI_ST1)); /* w1c finish-int */
 +		twr(st.spi, SPI_CMD, trd(st.spi, SPI_CMD) | SPI_ACT);
 +		if (!spi_done()) {
-+			printf("SWEET TOUCH: spi finish timeout st0=%#x st1=%#x\n",
-+			    trd(st.spi, SPI_ST0), trd(st.spi, SPI_ST1));
++			printf("SWEET TOUCH: spi finish timeout st0=%#x cmd=%#x\n",
++			    trd(st.spi, SPI_ST0), trd(st.spi, SPI_CMD));
 +			return false;
 +		}
 +		/* drain RX fifo */
@@ -1126,7 +1141,8 @@
 +	st.bm = ml_io_map(TP_IOC_BM, 0x1000);
 +	st.tl = ml_io_map(TP_IOC_TL, 0x1000);
 +	st.i2c = ml_io_map(TP_I2C5_PA, 0x1000);
-+	if (!st.spi || !st.gpio || !st.infra || !st.lm || !st.bm || !st.tl || !st.i2c) {
++	st.topck = ml_io_map(TP_TOPCK_PA, 0x1000);
++	if (!st.spi || !st.gpio || !st.infra || !st.lm || !st.bm || !st.tl || !st.i2c || !st.topck) {
 +		printf("SWEET TOUCH: MMIO mapping failed\n");
 +		goto out;
 +	}
