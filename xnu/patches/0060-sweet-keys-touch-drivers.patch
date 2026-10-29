@@ -292,7 +292,8 @@
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 --- /dev/null
 +++ b/bsd/dev/sweet_touch.c
-@@ -0,0 +1,788 @@
+@@ -0,0 +1,921 @@@@
++++ b/bsd/dev/sweet_touch.c
 +/*
 + * SWEET MT6853 SPI4 / Novatek NT36672C (oplus tp_noflash) touch bring-up.
 + * RMX2117 wiring from the stock DTBO: spi4@11018000, irq GPIO14, reset
@@ -371,6 +372,15 @@
 +#define TP_PIN_RST      43u   /* DTBO fragment@22 */
 +#define TP_PIN_RST2     33u   /* DTBO fragment@30 variant */
 +
++/* --- MT6360 sub-PMIC on i2c5: "vtouch"/VTP LDO2 feeds the NT36672C ---- */
++#define TP_I2C5_PA      0x11d00000u /* i2c5 controller */
++#define TP_PIN_SCL      107u        /* SCL5 */
++#define TP_PIN_SDA      108u        /* SDA5 */
++#define TP_I2C_FUNC     1u
++#define MT6360_ADDR     0x64u       /* subpmic_ldo, i2c-5 slave 0x64 */
++#define MT6360_LDO2_EN  0x11u       /* EN_CTRL2: bit6 enables LDO2 */
++#define MT6360_LDO2_VSEL 0x15u      /* CTRL3: 0x3d = 1.8 V (flat range) */
++
 +/* --- NT36672C constants (NT36675 mmap) ------------------------------- */
 +#define NVT_EVENT_BUF   0x22D00u
 +#define NVT_SWRST_N8    0x03F0FEu
@@ -403,7 +413,7 @@
 +extern const unsigned int sweet_nvt_fw_size;
 +
 +static struct {
-+	vm_offset_t spi, gpio, infra, lm, bm, tl;
++	vm_offset_t spi, gpio, infra, lm, bm, tl, i2c;
 +	bool started, dead, have_nvt, hw_cs;
 +	uint32_t active;
 +	int x[TP_TOUCH_MAX], y[TP_TOUCH_MAX];
@@ -461,6 +471,125 @@
 +gpio_in(unsigned pin)
 +{
 +	return (trd(st.gpio, TP_DIN(pin)) >> (pin % 32u)) & 1u;
++}
++
++/* --- i2c5 (vendor mtk controller, 16-bit regs) ------------------------ */
++#define I2C_REG_DATA      0x00u
++#define I2C_REG_SLAVE     0x04u
++#define I2C_REG_ISTAT     0x0cu
++#define I2C_REG_CONTROL   0x10u
++#define I2C_REG_XFER_LEN  0x14u
++#define I2C_REG_TRANS_LEN 0x18u
++#define I2C_REG_DELAY     0x1cu
++#define I2C_REG_TIMING    0x20u
++#define I2C_REG_START     0x24u
++#define I2C_REG_EXT_CONF  0x28u
++#define I2C_REG_FIFO_CLR  0x38u
++#define I2C_REG_IOCFG     0x40u
++#define I2C_REG_HS        0x48u
++#define I2C_REG_SOFTRST   0x50u
++#define I2C_REG_DCM_EN    0x54u
++#define I2C_REG_XFER_AUX  0x6cu
++#define I2C_CTL_RS        0x02u
++#define I2C_CTL_CLK_EXT   0x08u
++#define I2C_CTL_DIR_CHG   0x10u
++#define I2C_CTL_ACKERR    0x20u
++
++static uint16_t
++i2cr(uint32_t off)
++{
++	return *(volatile uint16_t *)(st.i2c + off);
++}
++
++static void
++i2cw(uint32_t off, uint16_t v)
++{
++	*(volatile uint16_t *)(st.i2c + off) = v;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++/* MT6360 i2c frames carry a crc8(0x07) over (addr<<1)|reg|data */
++static uint8_t
++crc8_07(const uint8_t *d, unsigned n)
++{
++	uint8_t c = 0;
++	while (n--) {
++		c ^= *d++;
++		for (int i = 0; i < 8; i++)
++			c = (c & 0x80u) ? (uint8_t)((c << 1) ^ 0x07u) : (uint8_t)(c << 1);
++	}
++	return c;
++}
++
++/* one transaction, optional read phase (RS+DIR_CHANGE). returns ISTAT. */
++static uint16_t
++i2c5_xfer(uint8_t addr, const uint8_t *wr, unsigned wlen, uint8_t *rd, unsigned rlen)
++{
++	uint16_t ctl = I2C_CTL_ACKERR | I2C_CTL_CLK_EXT;
++	unsigned i, spins = 200000;
++	uint16_t s = 0;
++	if (rlen)
++		ctl |= I2C_CTL_DIR_CHG | I2C_CTL_RS;
++	else
++		i2cw(I2C_REG_DELAY, 0x0002);
++	i2cw(I2C_REG_CONTROL, ctl);
++	i2cw(I2C_REG_SLAVE, (uint16_t)(addr << 1));
++	i2cw(I2C_REG_ISTAT, 0x0007);
++	i2cw(I2C_REG_FIFO_CLR, 0x0001);
++	i2cw(I2C_REG_XFER_LEN, (uint16_t)wlen);
++	i2cw(I2C_REG_XFER_AUX, (uint16_t)rlen);
++	i2cw(I2C_REG_TRANS_LEN, rlen ? 0x0002u : 0x0001u);
++	for (i = 0; i < wlen; i++)
++		i2cw(I2C_REG_DATA, wr[i]);
++	i2cw(I2C_REG_START, 0x0001);
++	while (spins-- && !((s = i2cr(I2C_REG_ISTAT)) & 0x0007))
++		;
++	for (i = 0; rd && i < rlen; i++)
++		rd[i] = (uint8_t)i2cr(I2C_REG_DATA);
++	return s;
++}
++
++static int
++mt6360_wr(uint8_t reg, uint8_t val)
++{
++	uint8_t f[4] = { reg & 0x3fu, val, 0, 0 };
++	uint8_t c[3] = { (uint8_t)(MT6360_ADDR << 1), f[0], f[1] };
++	f[2] = crc8_07(c, 3);
++	return (i2c5_xfer(MT6360_ADDR, f, 4, NULL, 0) & 0x0003u) ? 0 : -EIO;
++}
++
++static int
++mt6360_rd(uint8_t reg)
++{
++	uint8_t f[2] = { reg & 0x3fu, 0 };
++	uint8_t c[2] = { (uint8_t)(MT6360_ADDR << 1), f[0] };
++	uint8_t out[2] = { 0, 0 };
++	f[1] = crc8_07(c, 2);
++	if (!(i2c5_xfer(MT6360_ADDR, f, 2, out, 2) & 0x0003u))
++		return -1;
++	return out[0];
++}
++
++/* LDO2 ("vtouch") is not always-on: enable it before touching the SPI bus */
++static void
++vtp_power_on(void)
++{
++	gpio_mode(TP_PIN_SCL, TP_I2C_FUNC);
++	gpio_mode(TP_PIN_SDA, TP_I2C_FUNC);
++	i2cw(I2C_REG_SOFTRST, 0x0001);
++	i2cw(I2C_REG_DCM_EN, 0x0000);
++	i2cw(I2C_REG_IOCFG, 0x0003);  /* open-drain */
++	i2cw(I2C_REG_HS, 0x0000);
++	i2cw(I2C_REG_EXT_CONF, 0x1800); /* FS start condition */
++	i2cw(I2C_REG_TIMING, 0x073f);   /* ~150 kHz, conservative for the pmic */
++	int en = mt6360_rd(MT6360_LDO2_EN);
++	int vs = mt6360_rd(MT6360_LDO2_VSEL);
++	printf("SWEET TOUCH: vtp ldo2 before en=%#x vsel=%#x\n", en, vs);
++	(void)mt6360_wr(MT6360_LDO2_VSEL, 0x3du);
++	(void)mt6360_wr(MT6360_LDO2_EN, (uint8_t)((en > 0 ? en : 0) | 0x40u));
++	twait(10); /* vendor power-on-delay-us = 10000 */
++	printf("SWEET TOUCH: vtp ldo2 after en=%#x vsel=%#x\n",
++	    mt6360_rd(MT6360_LDO2_EN), mt6360_rd(MT6360_LDO2_VSEL));
 +}
 +
 +/* --- SPI4 ------------------------------------------------------------ */
@@ -982,7 +1111,8 @@
 +	st.lm = ml_io_map(TP_IOC_LM, 0x1000);
 +	st.bm = ml_io_map(TP_IOC_BM, 0x1000);
 +	st.tl = ml_io_map(TP_IOC_TL, 0x1000);
-+	if (!st.spi || !st.gpio || !st.infra || !st.lm || !st.bm || !st.tl) {
++	st.i2c = ml_io_map(TP_I2C5_PA, 0x1000);
++	if (!st.spi || !st.gpio || !st.infra || !st.lm || !st.bm || !st.tl || !st.i2c) {
 +		printf("SWEET TOUCH: MMIO mapping failed\n");
 +		goto out;
 +	}
@@ -1000,6 +1130,9 @@
 +	twr(st.lm, 0x0050, trd(st.lm, 0x0050) | (1u << 10)); /* GPIO12 IES */
 +	twr(st.tl, 0x0040, trd(st.tl, 0x0040) | (1u << 2));  /* GPIO14 IES */
 +	twr(st.tl, 0x0070, trd(st.tl, 0x0070) | (1u << 2));  /* GPIO14 PU */
++
++	/* "vtouch" LDO feeds the TDDI VCI; it is off until consumers ask */
++	vtp_power_on();
 +
 +	if (!spi_config()) {
 +		goto out;
