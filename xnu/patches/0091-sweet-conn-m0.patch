@@ -1,8 +1,7 @@
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -112,6 +112,7 @@
- bsd/dev/sweet_spmi.c			standard
- bsd/dev/sweet_usb.c			standard
+@@ -110,5 +110,6 @@
+ bsd/dev/sweet_touch.c			standard
  bsd/dev/sweet_gpu.c			standard
 +bsd/dev/sweet_conn.c			standard
  bsd/dev/sweet_nvt_fw.c			standard
@@ -10,20 +9,18 @@
  bsd/dev/munge.c 			optional config_requires_u32_munging
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
-@@ -54,6 +54,7 @@
+@@ -54,5 +54,6 @@
  extern void sweet_keys_init(void);
  extern void sweet_touch_init(void);
- extern void sweet_usb_probe(void);
  extern void sweet_gpu_init(void);
 +extern void sweet_conn_init(void);
  
  #define REG_CAP         0x00
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
-@@ -684,6 +684,7 @@
+@@ -682,5 +682,6 @@
  	sweet_keys_init();
  	sweet_touch_init();
- 	sweet_usb_probe();
  	sweet_gpu_init();
 +	sweet_conn_init();
  	return 0;

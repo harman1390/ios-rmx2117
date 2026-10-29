@@ -1,28 +1,28 @@
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -111,6 +111,7 @@
- bsd/dev/sweet_rpmh.c			standard
- bsd/dev/sweet_spmi.c			standard
- bsd/dev/sweet_usb.c			standard
+@@ -109,5 +109,6 @@
+ bsd/dev/sweet_keys.c			standard
+ bsd/dev/sweet_touch.c			standard
 +bsd/dev/sweet_gpu.c			standard
  bsd/dev/sweet_nvt_fw.c			standard
  bsd/dev/mem.c				standard
  bsd/dev/munge.c 			optional config_requires_u32_munging
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
-@@ -54,5 +54,6 @@
+@@ -53,5 +53,6 @@
+ extern void sweet_sample_start(void);
  extern void sweet_keys_init(void);
  extern void sweet_touch_init(void);
- extern void sweet_usb_probe(void);
 +extern void sweet_gpu_init(void);
  
  #define REG_CAP         0x00
 --- a/bsd/dev/sweet_ufs.c
 +++ b/bsd/dev/sweet_ufs.c
-@@ -683,5 +683,6 @@
+@@ -680,6 +680,7 @@
+ 	sweet_sample_start();
+ 	/* Input drivers (HID services in iokit/Kernel/arm/hid/SweetHID.cpp). */
  	sweet_keys_init();
  	sweet_touch_init();
- 	sweet_usb_probe();
 +	sweet_gpu_init();
  	return 0;
  }
