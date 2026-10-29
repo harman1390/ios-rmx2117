@@ -33,7 +33,7 @@
  
 --- /dev/null
 +++ b/bsd/dev/sweet_keys.c
-@@ -0,0 +1,224 @@
+@@ -0,0 +1,256 @@
 +/*
 + * SWEET keys for MediaTek MT6853 (RMX2117 / Narzo 30 Pro 5G).
 + *
@@ -49,14 +49,25 @@
 + * vol-down (GPIO80) already reads via DIN. GPIO1 (vol-up) does not; the
 + * working hypothesis is missing input-enable/pull, so this sets, in iocfg_br
 + * (0x11D40000) set IES@0x0070b12 (input enable), PU@0x00b0b12 (pull-up), and
-+ * clear PD@0x0090b12 (pull-down). Then it polls GPIO DIN and fires
-+ * sweet_hid_key on transitions.
++ * clear PD@0x0090b12 (pull-down) -- all three fields vendor-verified against
++ * pinctrl-mt6853.c (mt6853_pin_{ies,pu,pd}_range: pin1 -> base5(iocfg_br),
++ * 0x70/0xb0/0x90 bit12). Then it polls GPIO DIN and fires sweet_hid_key on
++ * transitions.
++ *
++ * The stock PMIC config also wires a "homekey" line (mt-pmic interrupts
++ * pwrkey/pwrkey_r/homekey/homekey_r; this phone has no physical home button,
++ * so homekey is the classic realme vol-up-to-PMIC wire). Because the dtbo's
++ * GPIO1 claim could not be proven, BOTH candidate lines are polled for
++ * vol-up: GPIO1 DIN and the MT6359 HOMEKEY_DEB bit. Each line must be seen
++ * released at least once before its presses count ("armed"), so a line that
++ * reads permanently-low (wrong pad, floating) can never fake a press.
 + *
 + * Power is the MT6359 PWRKEY. The DTB places mt6359-pmic under
 + * pwrap@10026000 (mediatek,mt6853-pwrap), so TOPSTATUS (0x2a) is read via
 + * the AP software channel SWINF_2 using the vendor ARB_V3 sequence:
 + * wait STA FSM idle, ACC=addr, wait FSM WFVLDCLR, read RDATA, VLD_CLR=1.
-+ * pressed = !(TOPSTATUS & 0x2) as in mtk-pmic-keys.c.
++ * pressed = !(TOPSTATUS & 0x2) as in mtk-pmic-keys.c; homekey = !(TOPSTATUS
++ * & 0x8) per the upstream mt6359_regs table (0x2/0x8 deb bits at 0x2a).
 + *
 + * sweet_hid_key indices: 0=power, 1=vol-up, 2=vol-down.
 + */
@@ -88,6 +99,7 @@
 +
 +#define MT6359_TOPSTATUS    0x02au
 +#define MT6359_PWRKEY_DEB   0x2u
++#define MT6359_HOMEKEY_DEB  0x8u
 +
 +/* MT6853 GPIO DIN: bank n register at 0x0200 + n*0x10, one bit per pin. */
 +#define KEYS_DIN_OFF(pin)   (0x0200u + ((pin) / 32u) * 0x10u)
@@ -124,7 +136,8 @@
 +}
 +
 +/* Configure GPIO1 (vol-up) as a readable input: GPIO func, input dir, input
-+ * enable (IES) and pull-up (PU) in iocfg_br. */
++ * enable (IES) and pull-up (PU) in iocfg_br. Field offsets/bits are the
++ * vendor pinctrl-mt6853.c pin_field tables, not guesses. */
 +static void
 +keys_cfg_volup(void)
 +{
@@ -186,37 +199,56 @@
 +static void
 +keys_thread(void *arg, wait_result_t result)
 +{
-+	static const unsigned pins[2] = { PIN_VOLUP, PIN_VOLDN };
-+	static const int keys[2] = { KEY_VOLUP, KEY_VOLDN };
-+	int state[2] = { 0, 0 }, cand[2] = { 0, 0 }, cnt[2] = { 0, 0 };
++	int vdn_state = 0, vdn_cand = 0, vdn_cnt = 0;
++	int vu_state[2] = { 0, 0 }, vu_cand[2] = { 0, 0 };
++	int vu_cnt[2] = { 0, 0 }, vu_armed[2] = { 0, 0 };
 +	int pwr = 0, pwr_err = 0;
 +	(void)arg;
 +	(void)result;
 +	for (;;) {
 +		/* Active-low keys; report after 3 equal samples (~30 ms). */
-+		for (int i = 0; i < 2; ++i) {
-+			int p = !key_din(pins[i]);
-+			if (p != cand[i]) {
-+				cand[i] = p;
-+				cnt[i] = 0;
-+			} else if (p != state[i] && ++cnt[i] >= 3) {
-+				state[i] = p;
-+				printf("KEYGPIO pin=%u %s\n", pins[i], p ? "down" : "up");
-+				sweet_hid_key(keys[i], p);
++		int p = !key_din(PIN_VOLDN);
++		if (p != vdn_cand) {
++			vdn_cand = p;
++			vdn_cnt = 0;
++		} else if (p != vdn_state && ++vdn_cnt >= 3) {
++			vdn_state = p;
++			printf("KEYGPIO pin=%u %s\n", PIN_VOLDN, p ? "down" : "up");
++			sweet_hid_key(KEY_VOLDN, p);
++		}
++
++		/* Vol-up candidate lines: 0 = GPIO1 DIN, 1 = PMIC HOMEKEY.
++		 * A line arms only after it has been seen released, so a
++		 * permanently-low wrong pad can never emit a press. */
++		uint32_t st = 0;
++		int pm_ok = (keys_pwrap && pwr_err < 50 &&
++		    pmic_read16(MT6359_TOPSTATUS, &st) == 0);
++		int vu_line[2];
++		vu_line[0] = !key_din(PIN_VOLUP);
++		vu_line[1] = pm_ok ? !(st & MT6359_HOMEKEY_DEB) : vu_state[1];
++		for (int s = 0; s < 2; ++s) {
++			p = vu_line[s];
++			if (!p)
++				vu_armed[s] = 1;
++			if (p != vu_cand[s]) {
++				vu_cand[s] = p;
++				vu_cnt[s] = 0;
++			} else if (vu_armed[s] && p != vu_state[s] && ++vu_cnt[s] >= 3) {
++				vu_state[s] = p;
++				printf("KEYVU src=%d %s\n", s, p ? "down" : "up");
++				sweet_hid_key(KEY_VOLUP, p);
 +			}
 +		}
-+		if (keys_pwrap && pwr_err < 50) {
-+			uint32_t st;
-+			if (pmic_read16(MT6359_TOPSTATUS, &st) == 0) {
-+				int p = !(st & MT6359_PWRKEY_DEB);
-+				if (p != pwr) {
-+					pwr = p;
-+					printf("KEYPMIC pwrkey=%d topstatus=%#x\n", p, st);
-+					sweet_hid_key(KEY_PWR, p);
-+				}
-+			} else if (++pwr_err == 50) {
-+				printf("SWEET KEYS: pwrap reads failing, power key disabled\n");
++
++		if (pm_ok) {
++			p = !(st & MT6359_PWRKEY_DEB);
++			if (p != pwr) {
++				pwr = p;
++				printf("KEYPMIC pwrkey=%d topstatus=%#x\n", p, st);
++				sweet_hid_key(KEY_PWR, p);
 +			}
++		} else if (keys_pwrap && ++pwr_err == 50) {
++			printf("SWEET KEYS: pwrap reads failing, power+homekey disabled\n");
 +		}
 +		keys_wait();
 +	}
@@ -248,7 +280,7 @@
 +	keys_pwrap = ml_io_map(KEYS_PWRAP_PA, 0x1000);
 +	if (!keys_pwrap)
 +		printf("SWEET KEYS: pwrap map failed (no power key)\n");
-+	printf("SWEET KEYS: volup=GPIO1(+ies/pu) voldn=GPIO80, din1=%d din80=%d\n",
++	printf("SWEET KEYS: volup=GPIO1+HOMEKEY voldn=GPIO80, din1=%d din80=%d\n",
 +	    key_din(PIN_VOLUP), key_din(PIN_VOLDN));
 +	kern_return_t kr = kernel_thread_start(keys_thread, NULL, &thread);
 +	if (kr == KERN_SUCCESS) {
@@ -260,7 +292,7 @@
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 --- /dev/null
 +++ b/bsd/dev/sweet_touch.c
-@@ -0,0 +1,784 @@
+@@ -0,0 +1,788 @@
 +/*
 + * SWEET MT6853 SPI4 / Novatek NT36672C (oplus tp_noflash) touch bring-up.
 + * RMX2117 wiring from the stock DTBO: spi4@11018000, irq GPIO14, reset
@@ -932,13 +964,17 @@
 +static void
 +touch_thread(void *arg, wait_result_t result)
 +{
-+	unsigned delay_s = 15;
++	unsigned delay_s = 0;
 +	uint8_t id[6] = {0};
 +	(void)arg;
 +	(void)result;
 +	(void)PE_parse_boot_argn("sweettouchdelay", &delay_s, sizeof(delay_s));
-+	printf("SWEET TOUCH: mt6853 spi4 starting in %u s\n", delay_s);
-+	twait(delay_s * 1000u);
++	if (delay_s) {
++		printf("SWEET TOUCH: mt6853 spi4 starting in %u s\n", delay_s);
++		twait(delay_s * 1000u);
++	} else {
++		printf("SWEET TOUCH: mt6853 spi4 starting now\n");
++	}
 +
 +	st.spi = ml_io_map(TP_SPI4_PA, 0x400);
 +	st.gpio = ml_io_map(TP_GPIO_PA, 0x800);

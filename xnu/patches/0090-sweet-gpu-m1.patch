@@ -1,0 +1,292 @@
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -111,6 +111,7 @@
+ bsd/dev/sweet_rpmh.c			standard
+ bsd/dev/sweet_spmi.c			standard
+ bsd/dev/sweet_usb.c			standard
++bsd/dev/sweet_gpu.c			standard
+ bsd/dev/sweet_nvt_fw.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -54,5 +54,6 @@
+ extern void sweet_keys_init(void);
+ extern void sweet_touch_init(void);
+ extern void sweet_usb_probe(void);
++extern void sweet_gpu_init(void);
+ 
+ #define REG_CAP         0x00
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -683,5 +683,6 @@
+ 	sweet_keys_init();
+ 	sweet_touch_init();
+ 	sweet_usb_probe();
++	sweet_gpu_init();
+ 	return 0;
+ }
+--- /dev/null
++++ b/bsd/dev/sweet_gpu.c
+@@ -0,0 +1,261 @@
++/*
++ * SWEET Mali-G57 (MT6853) milestone M1: power the MFG domains, ungate the
++ * mfgcfg clock and read GPU_ID.  Every register/sequence below is from
++ * vendor clk-mt6853-pg.c (spm_mtcmos_ctrl_mfg*) or the kbase r32p1 regmap
++ * documented in GPU-BRINGUP.md -- nothing here is guessed.
++ *
++ *   SPM (0x10006000):  PWR_STATUS=0x16c, PWR_STATUS_2ND=0x170
++ *   PWR_CON: MFG0=0x308 MFG1=0x30c MFG2=0x310 MFG3=0x314 MFG5=0x31c
++ *   PWR_CON bits: RST_B=b0 ISO=b1 ON=b2 ON_2ND=b3 CLK_DIS=b4 SRAM_PDN=b8
++ *                 SRAM_PDN_ACK=b12
++ *   sta_mask:        MFG0=b2 MFG1=b3 MFG2=b4 MFG3=b5 MFG5=b7
++ *   infracfg_ao (0x10001000): PROTECTEN_CLR=0x2a4, _1=0x2ac, _2=0x718
++ *   infracfg_pdn (0x10215000): MFG1_WAY_EN=0x4c (b11|b12)
++ *   MFG1 release order (vendor): sram_pdn=0 -> way_en=0x1800 ->
++ *     PROTECTEN_CLR=0x600000 -> PROTECTEN_2_CLR=0x80 ->
++ *     PROTECTEN_1_CLR=0x200000 -> PROTECTEN_2_CLR=0x60
++ *   mfgcfg (0x13FBF000): BG3D CG sta/set/clr = 0x0/0x4/0x8, bit0 (en = write1->clr)
++ *   mali (0x13000000, kbase r32p1 JM regmap):
++ *     GPU_ID 0x000 AS_PRESENT 0x018 JS_PRESENT 0x01c
++ *     GPU_IRQ_RAWSTAT 0x020 GPU_COMMAND 0x030 GPU_STATUS 0x034
++ *     SHADER_PRESENT_LO 0x100 _READY_LO 0x140 _PWRON_LO 0x180
++ *     TILER: 0x110/0x150/0x190  L2: 0x120/0x160/0x1a0
++ *     GPU_COMMAND: SOFT_RESET=1; IRQ RESET_COMPLETED=b8
++ *
++ * iOS-side reality check (see NOTES.md): iOS GPU services are AGX-only, so
++ * this can never produce Metal/Quartz acceleration on its own.  M1 only
++ * proves the silicon responds; everything is behind sweetgpu=1 (default off)
++ * because an untested MTCMOS sequence could wedge the boot.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern kern_return_t thread_terminate(thread_t);
++void sweet_gpu_init(void);
++
++#define GPU_SPM_PA       0x10006000u
++#define GPU_INFRA_PA     0x10001000u
++#define GPU_IPDN_PA      0x10215000u /* infracfg_pdn */
++#define GPU_MFGCFG_PA    0x13FBF000u
++#define GPU_MALI_PA      0x13000000u
++
++/* SPM */
++#define SP_PWR_STATUS    0x016cu
++#define SP_PWR_STATUS_2  0x0170u
++#define SP_MFG0_CON      0x0308u
++#define SP_MFG1_CON      0x030cu
++#define SP_MFG2_CON      0x0310u
++#define SP_MFG3_CON      0x0314u
++#define SP_MFG5_CON      0x031cu
++/* PWR_CON bits (vendor) */
++#define PWC_RST_B        (1u << 0)
++#define PWC_ISO          (1u << 1)
++#define PWC_ON           (1u << 2)
++#define PWC_ON_2ND       (1u << 3)
++#define PWC_CLK_DIS      (1u << 4)
++#define PWC_SRAM_PDN     (1u << 8)
++#define PWC_SRAM_ACK     (1u << 12)
++/* PWR_STATUS bits */
++#define STA_MFG0         (1u << 2)
++#define STA_MFG1         (1u << 3)
++#define STA_MFG2         (1u << 4)
++#define STA_MFG3         (1u << 5)
++#define STA_MFG5         (1u << 7)
++/* bus-protect */
++#define PROTEN_CLR       0x02a4u
++#define PROTEN_1_CLR     0x02acu
++#define PROTEN_2_CLR     0x0718u
++#define IPDN_MFG1_WAY_EN 0x004cu
++/* mfgcfg */
++#define MFGCG_STA        0x00u
++#define MFGCG_SET        0x04u
++#define MFGCG_CLR        0x08u
++#define MFGCG_ASYNC      0x20u
++#define MFGCG_ASYNC_1    0x24u
++#define MFGCG_GLOBAL     0xb0u
++#define MFGCG_QCHANNEL   0xb4u
++/* mali JM regmap (kbase r32p1) */
++#define MALI_GPU_ID        0x000u
++#define MALI_L2_FEATURES   0x004u
++#define MALI_CORE_FEATURES 0x008u
++#define MALI_MMU_FEATURES  0x014u
++#define MALI_AS_PRESENT    0x018u
++#define MALI_JS_PRESENT    0x01cu
++#define MALI_IRQ_RAWSTAT   0x020u
++#define MALI_IRQ_CLEAR     0x024u
++#define MALI_COMMAND       0x030u
++#define MALI_STATUS        0x034u
++#define MALI_SH_PRESENT_LO 0x100u
++#define MALI_TI_PRESENT_LO 0x110u
++#define MALI_L2_PRESENT_LO 0x120u
++#define MALI_SH_READY_LO   0x140u
++#define MALI_L2_READY_LO   0x160u
++#define MALI_SH_PWRON_LO   0x180u
++#define MALI_L2_PWRON_LO   0x1a0u
++#define CMD_SOFT_RESET     1u
++#define IRQ_RESET_DONE     (1u << 8)
++
++static vm_offset_t g_spm, g_infra, g_ipdn, g_mfgcfg, g_mali;
++
++static uint32_t
++grd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++gwr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++static int
++gpoll_sta(uint32_t mask, int on)
++{
++	for (int i = 0; i < 20000; ++i) {
++		if ((grd(g_spm, SP_PWR_STATUS) & mask) == (on ? mask : 0) &&
++		    (grd(g_spm, SP_PWR_STATUS_2) & mask) == (on ? mask : 0))
++			return 0;
++		delay(1);
++	}
++	return -1;
++}
++
++/* vendor power-on: ON|ON_2ND -> wait both status -> ~CLK_DIS -> ~ISO -> RST_B */
++static int
++mfg_pwr_on(uint32_t con, uint32_t sta, const char *name)
++{
++	gwr(g_spm, con, grd(g_spm, con) | PWC_ON);
++	gwr(g_spm, con, grd(g_spm, con) | PWC_ON_2ND);
++	if (gpoll_sta(sta, 1)) {
++		printf("SWEET GPU: %s power-on timeout con=%#x sta=%#x/%#x\n",
++		    name, grd(g_spm, con), grd(g_spm, SP_PWR_STATUS),
++		    grd(g_spm, SP_PWR_STATUS_2));
++		return -1;
++	}
++	gwr(g_spm, con, grd(g_spm, con) & ~PWC_CLK_DIS);
++	gwr(g_spm, con, grd(g_spm, con) & ~PWC_ISO);
++	gwr(g_spm, con, grd(g_spm, con) | PWC_RST_B);
++	printf("SWEET GPU: %s domain on\n", name);
++	return 0;
++}
++
++/* vendor MFG1 bus-protect release (spm_mtcmos_ctrl_mfg1_bus_prot) */
++static void
++mfg1_bus_release(void)
++{
++	gwr(g_spm, SP_MFG1_CON, grd(g_spm, SP_MFG1_CON) & ~PWC_SRAM_PDN);
++	for (int i = 0; i < 20000 && (grd(g_spm, SP_MFG1_CON) & PWC_SRAM_ACK); ++i)
++		delay(1);
++	gwr(g_ipdn, IPDN_MFG1_WAY_EN, 0x1800u);           /* way_en on, b11|b12 */
++	for (int i = 0; i < 20000 && (grd(g_ipdn, IPDN_MFG1_WAY_EN) & 0x1800u) != 0x1800u; ++i)
++		delay(1);
++	gwr(g_infra, PROTEN_CLR,   0x00600000u);          /* STEP2_0: b21|b22 */
++	gwr(g_infra, PROTEN_2_CLR, 0x00000080u);          /* STEP2_1: b7      */
++	gwr(g_infra, PROTEN_1_CLR, 0x00200000u);          /* STEP1_0: b21     */
++	gwr(g_infra, PROTEN_2_CLR, 0x00000060u);          /* STEP1_1: b5|b6   */
++	printf("SWEET GPU: mfg1 bus prot released\n");
++}
++
++static void
++gpu_thread(void *arg, wait_result_t result)
++{
++	(void)arg;
++	(void)result;
++
++	if (mfg_pwr_on(SP_MFG0_CON, STA_MFG0, "mfg0"))
++		goto out;
++	mfg_pwr_on(SP_MFG1_CON, STA_MFG1, "mfg1");
++	mfg_pwr_on(SP_MFG2_CON, STA_MFG2, "mfg2");
++	mfg_pwr_on(SP_MFG3_CON, STA_MFG3, "mfg3");
++	mfg_pwr_on(SP_MFG5_CON, STA_MFG5, "mfg5");
++	mfg1_bus_release();
++
++	/* ungate BG3D then apply the vendor external-CG sequence */
++	gwr(g_mfgcfg, MFGCG_CLR, 1);                        /* bg3d gate bit0 */
++	gwr(g_mfgcfg, MFGCG_ASYNC, grd(g_mfgcfg, MFGCG_ASYNC) | (0xfu << 22));
++	gwr(g_mfgcfg, MFGCG_GLOBAL, grd(g_mfgcfg, MFGCG_GLOBAL) & ~(0x3u << 9));
++	gwr(g_mfgcfg, MFGCG_QCHANNEL, grd(g_mfgcfg, MFGCG_QCHANNEL) | (1u << 4));
++	gwr(g_mfgcfg, MFGCG_GLOBAL, grd(g_mfgcfg, MFGCG_GLOBAL) & ~((1u << 19) | (1u << 8)));
++	gwr(g_mfgcfg, MFGCG_ASYNC_1, grd(g_mfgcfg, MFGCG_ASYNC_1) | 1u);
++	printf("SWEET GPU: mfgcg sta=%#x global=%#x\n",
++	    grd(g_mfgcfg, MFGCG_STA), grd(g_mfgcfg, MFGCG_GLOBAL));
++
++	uint32_t id = grd(g_mali, MALI_GPU_ID);
++	printf("SWEET GPU: GPU_ID=%#08x AS=%#x JS=%#x L2f=%#x COREf=%#x MMUf=%#x\n",
++	    id, grd(g_mali, MALI_AS_PRESENT), grd(g_mali, MALI_JS_PRESENT),
++	    grd(g_mali, MALI_L2_FEATURES), grd(g_mali, MALI_CORE_FEATURES),
++	    grd(g_mali, MALI_MMU_FEATURES));
++	if (id == 0 || id == 0xffffffffu) {
++		printf("SWEET GPU: no response at 0x13000000, stopping\n");
++		goto out;
++	}
++
++	/* kbase-style: soft reset, wait RESET_COMPLETED irq bit */
++	gwr(g_mali, MALI_IRQ_CLEAR, IRQ_RESET_DONE);
++	gwr(g_mali, MALI_COMMAND, CMD_SOFT_RESET);
++	for (int i = 0; i < 100000 &&
++	    !(grd(g_mali, MALI_IRQ_RAWSTAT) & IRQ_RESET_DONE); ++i)
++		delay(1);
++	printf("SWEET GPU: soft reset done=%d status=%#x\n",
++	    !!(grd(g_mali, MALI_IRQ_RAWSTAT) & IRQ_RESET_DONE),
++	    grd(g_mali, MALI_STATUS));
++
++	/* power L2 + all shader cores, wait READY == PRESENT */
++	uint32_t sh = grd(g_mali, MALI_SH_PRESENT_LO);
++	uint32_t l2 = grd(g_mali, MALI_L2_PRESENT_LO);
++	printf("SWEET GPU: present shader=%#x tiler=%#x l2=%#x\n",
++	    sh, grd(g_mali, MALI_TI_PRESENT_LO), l2);
++	gwr(g_mali, MALI_L2_PWRON_LO, l2);
++	gwr(g_mali, MALI_SH_PWRON_LO, sh);
++	for (int i = 0; i < 100000 &&
++	    (grd(g_mali, MALI_L2_READY_LO) != l2 ||
++	     grd(g_mali, MALI_SH_READY_LO) != sh); ++i)
++		delay(1);
++	printf("SWEET GPU: ready l2=%#x sh=%#x\n",
++	    grd(g_mali, MALI_L2_READY_LO), grd(g_mali, MALI_SH_READY_LO));
++out:
++	(void)thread_terminate(current_thread());
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++void
++sweet_gpu_init(void)
++{
++	static int started;
++	int enabled = 0; /* off unless sweetgpu=1: untested MTCMOS may wedge */
++	thread_t thread;
++	if (started)
++		return;
++	started = 1;
++	(void)PE_parse_boot_argn("sweetgpu", &enabled, sizeof(enabled));
++	if (!enabled) {
++		printf("SWEET GPU: off (sweetgpu=1 to probe Mali-G57 M1)\n");
++		return;
++	}
++	g_spm = ml_io_map(GPU_SPM_PA, 0x1000);
++	g_infra = ml_io_map(GPU_INFRA_PA, 0x1000);
++	g_ipdn = ml_io_map(GPU_IPDN_PA, 0x1000);
++	g_mfgcfg = ml_io_map(GPU_MFGCFG_PA, 0x1000);
++	g_mali = ml_io_map(GPU_MALI_PA, 0x1000);
++	if (!g_spm || !g_infra || !g_ipdn || !g_mfgcfg || !g_mali) {
++		printf("SWEET GPU: MMIO map failed\n");
++		return;
++	}
++	kern_return_t kr = kernel_thread_start(gpu_thread, NULL, &thread);
++	if (kr == KERN_SUCCESS)
++		thread_deallocate(thread);
++	else
++		printf("SWEET GPU: kernel_thread_start failed %d\n", kr);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
