@@ -292,7 +292,7 @@
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 --- /dev/null
 +++ b/bsd/dev/sweet_touch.c
-@@ -0,0 +1,920 @@
+@@ -0,0 +1,931 @@
 +/*
 + * SWEET MT6853 SPI4 / Novatek NT36672C (oplus tp_noflash) touch bring-up.
 + * RMX2117 wiring from the stock DTBO: spi4@11018000, irq GPIO14, reset
@@ -560,12 +560,23 @@
 +static int
 +mt6360_rd(uint8_t reg)
 +{
-+	uint8_t f[2] = { reg & 0x3fu, 0 };
-+	uint8_t c[2] = { (uint8_t)(MT6360_ADDR << 1), f[0] };
++	uint8_t f[1] = { reg & 0x3fu };
 +	uint8_t out[2] = { 0, 0 };
-+	f[1] = crc8_07(c, 2);
-+	if (!(i2c5_xfer(MT6360_ADDR, f, 2, out, 2) & 0x0003u))
++	uint8_t c[3];
++	uint16_t s = i2c5_xfer(MT6360_ADDR, f, 1, out, 2);
++	if (!(s & 0x0003u)) {
++		printf("SWEET TOUCH: i2c5 rd reg=%#x failed istat=%#x\n", reg, s);
 +		return -1;
++	}
++	/* crck = crc8(addr_r | reg | val) */
++	c[0] = (uint8_t)((MT6360_ADDR << 1) | 1);
++	c[1] = f[0];
++	c[2] = out[0];
++	if (crc8_07(c, 3) != out[1]) {
++		printf("SWEET TOUCH: i2c5 rd reg=%#x crc bad val=%#x crck=%#x\n",
++		    reg, out[0], out[1]);
++		return -1;
++	}
 +	return out[0];
 +}
 +
