@@ -292,7 +292,7 @@
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 --- /dev/null
 +++ b/bsd/dev/sweet_touch.c
-@@ -0,0 +1,931 @@
+@@ -0,0 +1,935 @@
 +/*
 + * SWEET MT6853 SPI4 / Novatek NT36672C (oplus tp_noflash) touch bring-up.
 + * RMX2117 wiring from the stock DTBO: spi4@11018000, irq GPIO14, reset
@@ -350,9 +350,9 @@
 +#define SPI_RXMSBF      (1u << 13)
 +#define SPI_FINISH_IE   (1u << 16)
 +#define SPI_PAUSE_IE    (1u << 17)
-+/* ST0: bit0 = finish, bit1 = pause */
-+#define SPI_ST0_FINISH  1u
++/* ST0 bit1 = pause-int; ST1 bit0 = finish-int (vendor spi-mt65xx) */
 +#define SPI_ST0_PAUSE   2u
++#define SPI_ST1_FINISH  1u
 +
 +#define SPI_FIFO        32u
 +
@@ -554,7 +554,7 @@
 +	uint8_t f[4] = { reg & 0x3fu, val, 0, 0 };
 +	uint8_t c[3] = { (uint8_t)(MT6360_ADDR << 1), f[0], f[1] };
 +	f[2] = crc8_07(c, 3);
-+	return (i2c5_xfer(MT6360_ADDR, f, 4, NULL, 0) & 0x0003u) ? 0 : -EIO;
++	return (i2c5_xfer(MT6360_ADDR, f, 4, NULL, 0) & 0x0007u) == 0x0001u ? 0 : -EIO;
 +}
 +
 +static int
@@ -564,7 +564,7 @@
 +	uint8_t out[2] = { 0, 0 };
 +	uint8_t c[3];
 +	uint16_t s = i2c5_xfer(MT6360_ADDR, f, 1, out, 2);
-+	if (!(s & 0x0003u)) {
++	if ((s & 0x0007u) != 0x0001u) {
 +		printf("SWEET TOUCH: i2c5 rd reg=%#x failed istat=%#x\n", reg, s);
 +		return -1;
 +	}
@@ -654,10 +654,13 @@
 +{
 +	uint32_t s;
 +	for (unsigned i = 0; i < 40000; ++i) {
-+		s = trd(st.spi, SPI_ST0);
-+		if (s & SPI_ST0_FINISH) {
++		/* finish int-status is ST1 bit0; ST0 bit1 is pause-int */
++		s = trd(st.spi, SPI_ST1);
++		if (s & SPI_ST1_FINISH) {
++			twr(st.spi, SPI_ST1, s); /* w1c */
 +			return true;
 +		}
++		s = trd(st.spi, SPI_ST0);
 +		if (s & SPI_ST0_PAUSE) {
 +			/* unexpected mid-transfer pause; keep it moving */
 +			twr(st.spi, SPI_CMD, trd(st.spi, SPI_CMD) | SPI_RESUME);
@@ -682,9 +685,9 @@
 +		if (n > SPI_FIFO) {
 +			n = SPI_FIFO;
 +		}
-+		/* packet = n bytes, single loop */
++		/* packet = n bytes, single loop; keep cs_idle (bits0-7) */
 +		uint32_t c1 = trd(st.spi, SPI_CFG1);
-+		c1 = (c1 & ~0x3ff00ffu) | ((n - 1u) << 16) | (0u << 8);
++		c1 = (c1 & ~0x3ffff00u) | ((n - 1u) << 16);
 +		twr(st.spi, SPI_CFG1, c1);
 +		/* fill TX fifo */
 +		unsigned i = 0;
@@ -704,6 +707,7 @@
 +			twr(st.spi, SPI_TXD, v);
 +		}
 +		twr(st.spi, SPI_ST0, trd(st.spi, SPI_ST0)); /* w1c */
++		twr(st.spi, SPI_ST1, trd(st.spi, SPI_ST1)); /* w1c finish-int */
 +		twr(st.spi, SPI_CMD, trd(st.spi, SPI_CMD) | SPI_ACT);
 +		if (!spi_done()) {
 +			printf("SWEET TOUCH: spi finish timeout st0=%#x st1=%#x\n",
