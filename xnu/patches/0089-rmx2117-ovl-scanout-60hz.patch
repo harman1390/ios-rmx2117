@@ -1,0 +1,129 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 60cb306..6854587 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -95,6 +95,7 @@ enum {
+ #define SWEET_OVL_SRC_CON               0x002c
+ #define SWEET_OVL_L_ADDR(n)             (0x0f40 + 0x20 * (n))     /* mt6853 */
+ #define SWEET_OVL_L_PITCH(n)            (0x0044 + 0x20 * (n))     /* low 16b */
++#define SWEET_OVL_L_PITCH_MSB(n)        (0x0040 + 0x20 * (n))     /* pitch[19:16] */
+ #define SWEET_DSI_START                 0x000c
+ 
+ class IOMobileFramebuffer : public IOService {
+@@ -137,6 +138,8 @@ public:
+ 	uint32_t      fScanPitch;     /* pitch programmed into OVL L1 */
+ 	uint32_t      fDirect;        /* sweetfb_direct: DMA the surface, no copy */
+ 	uint32_t      fDirectMiss;    /* frames that fell back to the copy */
++	uint32_t      fStatDirect;    /* presents done by OVL scanout */
++	uint32_t      fStatCopy;      /* presents done by CPU memcpy */
+ 	uint32_t      fKick;          /* sweetfb_kick: DSI_START per present */
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+@@ -227,16 +230,19 @@ AppleCLCD::start(IOService *provider)
+ 	fScan[0] = fScan[1] = NULL;
+ 	fScanPitch = 0;
+ 	fDirectMiss = 0;
++	fStatDirect = fStatCopy = 0;
+ 	if (fOVL != NULL) {
+ 		uint32_t en = fOVL[SWEET_OVL_EN / 4];
+ 		uint32_t src_con = fOVL[SWEET_OVL_SRC_CON / 4];
+ 		uint32_t l_addr = fOVL[SWEET_OVL_L_ADDR(1) / 4];
+ 		uint32_t l_pitch = fOVL[SWEET_OVL_L_PITCH(1) / 4];
+-		IOLog("SWEET FB: ovl0_2l en 0x%x src_con 0x%x L1 addr 0x%x pitch 0x%x\n",
+-		    en, src_con, l_addr, l_pitch);
++		uint32_t l_pitchmsb = fOVL[SWEET_OVL_L_PITCH_MSB(1) / 4];
++		IOLog("SWEET FB: ovl0_2l en 0x%x src_con 0x%x L1 addr 0x%x pitch 0x%x msb 0x%x\n",
++		    en, src_con, l_addr, l_pitch, l_pitchmsb);
+ 		fScanPitch = l_pitch & 0xffff;
+ 		if (!(en & 1) || !(src_con & (1u << 1)) ||
+-		    l_addr != (uint32_t)fPhys || fScanPitch != fRowBytes) {
++		    l_addr != (uint32_t)fPhys || fScanPitch != fRowBytes ||
++		    (l_pitchmsb & 0xf) != ((fRowBytes >> 16) & 0xf)) {
+ 			IOLog("SWEET FB: ovl0_2l L1 not scanning this fb; direct off\n");
+ 			fDirect = 0;
+ 		}
+@@ -259,7 +265,7 @@ AppleCLCD::start(IOService *provider)
+ 		IOLog("SWEET FB: no vsync timer\n");
+ 		return false;
+ 	}
+-	uint32_t hz = 10;
++	uint32_t hz = 60;
+ 	PE_parse_boot_argn("sweetfb_hz", &hz, sizeof(hz));
+ 	fFlushTicks = (hz == 0 || hz >= 60) ? 1 : 60 / hz;
+ 	fVsync->setTimeoutUS(SWEET_FB_VSYNC_US);
+@@ -306,6 +312,7 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 				fb->fOVL[SWEET_OVL_L_ADDR(1) / 4] = (uint32_t)fb->fPhys;
+ 				if (fb->fScanPitch != fb->fRowBytes) {
+ 					fb->fOVL[SWEET_OVL_L_PITCH(1) / 4] = fb->fRowBytes;
++					fb->fOVL[SWEET_OVL_L_PITCH_MSB(1) / 4] = 0;
+ 					fb->fScanPitch = fb->fRowBytes;
+ 				}
+ 				OSSynchronizeIO();
+@@ -338,6 +345,11 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		fb->present(rec);
+ 		IOFreeData(rec, SWEET_FB_SWAP_REC_SIZE);
+ 	}
++	if ((count % 300) == 0 && (fb->fStatDirect != 0 || fb->fStatCopy != 0)) {
++		IOLog("SWEET FB: ~5s: %u direct %u copy %u miss\n",
++		    fb->fStatDirect, fb->fStatCopy, fb->fDirectMiss);
++		fb->fStatDirect = fb->fStatCopy = 0;
++	}
+ 	sender->setTimeoutUS(SWEET_FB_VSYNC_US);
+ }
+ 
+@@ -385,7 +397,7 @@ static uint64_t sweet_fb_swap_count;
+  * A swap only records the frame: copying 10 MB into the panel on every
+  * swap (backboardd presents at 60 Hz) took the whole CPU. The vsync timer
+  * shows the latest frame every fFlushTicks ticks (boot-arg sweetfb_hz,
+- * default 10 Hz).
++ * default 60 Hz).
+  */
+ void
+ AppleCLCD::swap(const uint8_t *rec)
+@@ -495,6 +507,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 			fOVL[SWEET_OVL_L_ADDR(1) / 4] = (uint32_t)addr;
+ 			if (pitch != fScanPitch) {
+ 				fOVL[SWEET_OVL_L_PITCH(1) / 4] = pitch;
++				fOVL[SWEET_OVL_L_PITCH_MSB(1) / 4] = 0;
+ 				fScanPitch = pitch;
+ 			}
+ 			OSSynchronizeIO();
+@@ -507,6 +520,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 				fScan[0]->retain();
+ 			}
+ 			s->release();
++			fStatDirect++;
+ 			kick();
+ 			return;
+ 		}
+@@ -520,6 +534,22 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+ 	}
+ 
++	/* A frame that fell back to the copy path must pull OVL L1 back onto
++	 * fPhys: it may still be scanning the previous direct surface, and
++	 * the pixels memcpy'd below land in fPhys, not there. */
++	if (fOVL != NULL && fScan[0] != NULL) {
++		fOVL[SWEET_OVL_L_ADDR(1) / 4] = (uint32_t)fPhys;
++		if (fScanPitch != fRowBytes) {
++			fOVL[SWEET_OVL_L_PITCH(1) / 4] = fRowBytes;
++			fOVL[SWEET_OVL_L_PITCH_MSB(1) / 4] = 0;
++			fScanPitch = fRowBytes;
++		}
++		OSSynchronizeIO();
++		OSSafeReleaseNULL(fScan[1]);
++		fScan[1] = fScan[0];
++		fScan[0] = NULL;
++	}
++
+ 	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
+ 		uint32_t id = get32(rec, 0x54 + 4 * layer);
+ 		const uint8_t *a = rec + 0x64 + 16 * layer;
+@@ -595,6 +625,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+ 		s->release();
+ 	}
++	fStatCopy++;
+ 	kick();
+ }
+ 

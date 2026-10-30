@@ -1,0 +1,280 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 742dd28..60cb306 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -48,9 +48,12 @@ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+ #include <IOKit/IOTimerEventSource.h>
+ #include <IOKit/system.h>
+ #include <pexpert/pexpert.h>
++#include <machine/machine_routines.h>
+ #include <kern/clock.h>
+ #include <sys/proc.h>
+ 
++extern "C" void flush_dcache64(addr64_t addr, unsigned count, int phys);
++
+ enum {
+ 	kSweetFBGetLayerDefaultSurface  = 3,
+ 	kSweetFBSwapBegin               = 4,
+@@ -82,6 +85,18 @@ enum {
+ #define SWEET_FB_LOGICAL_H              2436
+ #define SWEET_FB_FORMAT_BGRA            0x42475241
+ 
++/* rmx2117 (MT6853): disp_ovl0_2l feeds the panel -- its layer 1 DMAs
++ * fPhys to the DSI cmd-mode pipe today. dsi0 needs a DSI_START (+0x0C)
++ * 0->1 toggle per frame. Addresses from research/rmt6853/mt6853-src.dts
++ * and the vendor kernel's mtk_disp_ovl.c. */
++#define SWEET_FB_OVL_PA                 0x14006000ULL
++#define SWEET_FB_DSI_PA                 0x14013000ULL
++#define SWEET_OVL_EN                    0x000c
++#define SWEET_OVL_SRC_CON               0x002c
++#define SWEET_OVL_L_ADDR(n)             (0x0f40 + 0x20 * (n))     /* mt6853 */
++#define SWEET_OVL_L_PITCH(n)            (0x0044 + 0x20 * (n))     /* low 16b */
++#define SWEET_DSI_START                 0x000c
++
+ class IOMobileFramebuffer : public IOService {
+ 	OSDeclareDefaultStructors(IOMobileFramebuffer);
+ };
+@@ -116,12 +131,20 @@ public:
+ 	uint32_t      fFlushTicks;    /* vsync ticks between panel copies */
+ 	bool          fPowerOff;      /* RequestPowerChange(0) */
+ 	uint32_t      fFadeStep;      /* fade-out steps done while off */
++	volatile uint32_t *fOVL;      /* disp_ovl0_2l regs: direct scanout */
++	volatile uint32_t *fDSI;      /* dsi0 regs: cmd-mode frame kick */
++	SweetSurface *fScan[2];       /* surfaces OVL L1 reads (cur, prev) */
++	uint32_t      fScanPitch;     /* pitch programmed into OVL L1 */
++	uint32_t      fDirect;        /* sweetfb_direct: DMA the surface, no copy */
++	uint32_t      fDirectMiss;    /* frames that fell back to the copy */
++	uint32_t      fKick;          /* sweetfb_kick: DSI_START per present */
+ 
+ 	bool start(IOService *provider) APPLE_KEXT_OVERRIDE;
+ 	void addClient(IOMobileFramebufferUserClient *client);
+ 	void removeClient(IOMobileFramebufferUserClient *client);
+ 	void swap(const uint8_t *rec);
+ 	void present(const uint8_t *rec);
++	void kick(void);              /* toggle DSI_START: latch a cmd-mode frame */
+ };
+ 
+ OSDefineMetaClassAndStructors(AppleCLCD, IOMobileFramebuffer);
+@@ -189,6 +212,37 @@ AppleCLCD::start(IOService *provider)
+ 	}
+ 	fOffX = (int32_t)(fLogicalW - fWidth) / 2;
+ 	fOffY = (int32_t)(fLogicalH - fHeight) / 2;
++	/* dsi0 kick: a GUI frame reaches the cmd-mode panel only after
++	 * DSI_START toggles. The early-console and fbcon kicks stop once
++	 * those consoles hand over, so present() does its own. */
++	fKick = 1;
++	PE_parse_boot_argn("sweetfb_kick", &fKick, sizeof(fKick));
++	fDSI = (volatile uint32_t *)ml_io_map(SWEET_FB_DSI_PA, 0x1000);
++	/* Direct scanout: repointing OVL L1's DMA at a contiguous CA
++	 * surface skips the ~10 MB CPU copy in present(). Trust it only
++	 * if LK left layer 1 scanning this very framebuffer. */
++	fDirect = 1;
++	PE_parse_boot_argn("sweetfb_direct", &fDirect, sizeof(fDirect));
++	fOVL = fDirect ? (volatile uint32_t *)ml_io_map(SWEET_FB_OVL_PA, 0x1000) : NULL;
++	fScan[0] = fScan[1] = NULL;
++	fScanPitch = 0;
++	fDirectMiss = 0;
++	if (fOVL != NULL) {
++		uint32_t en = fOVL[SWEET_OVL_EN / 4];
++		uint32_t src_con = fOVL[SWEET_OVL_SRC_CON / 4];
++		uint32_t l_addr = fOVL[SWEET_OVL_L_ADDR(1) / 4];
++		uint32_t l_pitch = fOVL[SWEET_OVL_L_PITCH(1) / 4];
++		IOLog("SWEET FB: ovl0_2l en 0x%x src_con 0x%x L1 addr 0x%x pitch 0x%x\n",
++		    en, src_con, l_addr, l_pitch);
++		fScanPitch = l_pitch & 0xffff;
++		if (!(en & 1) || !(src_con & (1u << 1)) ||
++		    l_addr != (uint32_t)fPhys || fScanPitch != fRowBytes) {
++			IOLog("SWEET FB: ovl0_2l L1 not scanning this fb; direct off\n");
++			fDirect = 0;
++		}
++	} else {
++		fDirect = 0;
++	}
+ 	fLock = IOLockAlloc();
+ 	fClients = OSArray::withCapacity(4);
+ 	fSurface = sweet_surface_create_physical(fPhys, fWidth, fHeight, fRowBytes, SWEET_FB_FORMAT_BGRA);
+@@ -245,6 +299,21 @@ AppleCLCD::vsyncFired(OSObject *owner, IOTimerEventSource *sender)
+ 		}
+ 		IOLockUnlock(fb->fLock);
+ 		if (step <= 6) {
++			/* The fade writes the panel fb: if OVL L1 was scanning
++			 * a CA surface, point it back here first. Keep the
++			 * previous buffer alive one more frame like present(). */
++			if (fb->fOVL != NULL && fb->fScan[0] != NULL) {
++				fb->fOVL[SWEET_OVL_L_ADDR(1) / 4] = (uint32_t)fb->fPhys;
++				if (fb->fScanPitch != fb->fRowBytes) {
++					fb->fOVL[SWEET_OVL_L_PITCH(1) / 4] = fb->fRowBytes;
++					fb->fScanPitch = fb->fRowBytes;
++				}
++				OSSynchronizeIO();
++				OSSafeReleaseNULL(fb->fScan[1]);
++				fb->fScan[1] = fb->fScan[0];
++				fb->fScan[0] = NULL;
++			}
++			fb->kick();
+ 			for (uint32_t y = 0; y < fb->fHeight; y++) {
+ 				volatile uint32_t *row = (volatile uint32_t *)(fb->fPixels + (uint64_t)y * fb->fRowBytes);
+ 				for (uint32_t x = 0; x < fb->fWidth; x++) {
+@@ -299,6 +368,15 @@ get32(const uint8_t *p, uint32_t off)
+ 	return v;
+ }
+ 
++void
++AppleCLCD::kick(void)
++{
++	if (fDSI != NULL && fKick) {
++		fDSI[SWEET_DSI_START / 4] = 0;
++		fDSI[SWEET_DSI_START / 4] = 1;
++	}
++}
++
+ static uint32_t sweet_fb_swaps_logged;
+ static uint64_t sweet_fb_swap_count;
+ 
+@@ -337,6 +415,111 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+ 	}
+ 
++	/* Direct scanout: when CoreAnimation handed us a single layer
++	 * (its composited frame), aim OVL L1's DMA at that surface and
++	 * kick DSI. No CPU copy. Falls through to the copy path whenever
++	 * the frame or the surface does not qualify. */
++	if (fDirect && fOVL != NULL && mask != 0 && (mask & (mask - 1)) == 0) {
++		uint32_t layer = 0;
++		while (!((mask >> layer) & 1)) {
++			layer++;
++		}
++		uint32_t id = get32(rec, 0x54 + 4 * layer);
++		const uint8_t *ra = rec + 0x64 + 16 * layer;
++		const uint8_t *rb = rec + 0xc4 + 16 * layer;
++		SweetSurface *s = id != 0 ? sweet_surface_copy(id) : NULL;
++		uint64_t addr = 0;
++		uint32_t pitch = 0;
++		if (s != NULL) {
++			int32_t sx = (int32_t)get32(ra, 0), sy = (int32_t)get32(ra, 4);
++			int32_t dx = (int32_t)get32(rb, 0), dy = (int32_t)get32(rb, 4);
++			int32_t w = (int32_t)get32(rb, 8), h = (int32_t)get32(rb, 12);
++			if (w <= 0 || h <= 0) {
++				w = (int32_t)s->width;
++				h = (int32_t)s->height;
++			}
++			if (sx < 0 || sy < 0) {
++				sx = sy = 0;
++			}
++			if (dx < 0 || dy < 0) {
++				dx = dy = 0;
++			}
++			dx -= fOffX;
++			dy -= fOffY;
++			if (dx < 0) {
++				sx -= dx;
++				w += dx;
++				dx = 0;
++			}
++			if (dy < 0) {
++				sy -= dy;
++				h += dy;
++				dy = 0;
++			}
++			if (w > (int32_t)fWidth - dx) {
++				w = (int32_t)fWidth - dx;
++			}
++			if (h > (int32_t)fHeight - dy) {
++				h = (int32_t)fHeight - dy;
++			}
++			/* Full-bleed 4-byte pixels in one physical run, pitch
++			 * fitting OVL's 16-bit field: OVL can DMA it as-is. */
++			if (dx == 0 && dy == 0 && w == (int32_t)fWidth &&
++			    h == (int32_t)fHeight && sx + w <= (int32_t)s->width &&
++			    sy + h <= (int32_t)s->height && s->elementWidth == 1 &&
++			    s->elementHeight == 1 && s->bytesPerElement == 4 &&
++			    s->bytesPerRow <= 0xffff && s->memory != NULL) {
++				IOByteCount seglen = 0;
++				addr64_t seg0 = s->memory->getPhysicalSegment(0, &seglen);
++				uint64_t need = (uint64_t)s->offset +
++				    (uint64_t)(sy + h - 1) * s->bytesPerRow +
++				    (uint64_t)(sx + w) * 4;
++				if (seg0 != 0 && seglen >= need &&
++				    seg0 + need <= 0x100000000ULL) {
++					addr = seg0 + s->offset +
++					    (uint64_t)sy * s->bytesPerRow +
++					    (uint64_t)sx * 4;
++					pitch = s->bytesPerRow;
++					/* CA's writes may still sit in the
++					 * dcache; clean the scan rect so
++					 * the OVL DMA sees them. */
++					flush_dcache64(seg0 + s->offset +
++					    (uint64_t)sy * s->bytesPerRow +
++					    (uint64_t)sx * 4,
++					    (unsigned)((uint64_t)(h - 1) * s->bytesPerRow +
++					    (uint64_t)w * 4), 1);
++				}
++			}
++		}
++		if (addr != 0) {
++			fOVL[SWEET_OVL_L_ADDR(1) / 4] = (uint32_t)addr;
++			if (pitch != fScanPitch) {
++				fOVL[SWEET_OVL_L_PITCH(1) / 4] = pitch;
++				fScanPitch = pitch;
++			}
++			OSSynchronizeIO();
++			/* The OVL may still be DMA-ing the previous frame:
++			 * release only the surface from two presents ago. */
++			if (fScan[0] != s) {
++				OSSafeReleaseNULL(fScan[1]);
++				fScan[1] = fScan[0];
++				fScan[0] = s;
++				fScan[0]->retain();
++			}
++			s->release();
++			kick();
++			return;
++		}
++		if (s != NULL) {
++			fDirectMiss++;
++			if (fDirectMiss <= 8 || (fDirectMiss & 0xff) == 0) {
++				IOLog("SWEET FB: direct miss %u (surface %u %ux%u bpr %u)\n",
++				    fDirectMiss, id, s->width, s->height, s->bytesPerRow);
++			}
++			s->release();
++		}
++	}
++
+ 	for (uint32_t layer = 0; layer < SWEET_FB_LAYERS; layer++) {
+ 		uint32_t id = get32(rec, 0x54 + 4 * layer);
+ 		const uint8_t *a = rec + 0x64 + 16 * layer;
+@@ -412,6 +595,7 @@ AppleCLCD::present(const uint8_t *rec)
+ 		}
+ 		s->release();
+ 	}
++	kick();
+ }
+ 
+ bool
+diff --git a/iokit/Kernel/arm/SweetSurface.cpp b/iokit/Kernel/arm/SweetSurface.cpp
+index 7f90c56..afead0d 100644
+--- a/iokit/Kernel/arm/SweetSurface.cpp
++++ b/iokit/Kernel/arm/SweetSurface.cpp
+@@ -688,8 +688,20 @@ IOSurfaceRootUserClient::create(IOExternalMethodArguments *args)
+ 		IOBufferMemoryDescriptor *mem = NULL;
+ 		if ((uint64_t)OSAddAtomic64(s->allocSize, (volatile SInt64 *)&sweet_surface_wired) +
+ 		    s->allocSize <= SWEET_SURFACE_WIRED_MAX) {
+-			mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
+-			    kIODirectionInOut | kIOMemoryKernelUserShared, s->allocSize, page_size);
++			/* rmx2117: OVL L1 can scan a CA surface out with no
++			 * CPU copy (the direct path in SweetFramebuffer), but
++			 * only if the pixels are one physical run. Try a
++			 * contiguous allocation for fullscreen-class surfaces
++			 * and fall back to ordinary pages when it fails. */
++			if (s->allocSize >= (8u << 20)) {
++				mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++				    kIODirectionInOut | kIOMemoryKernelUserShared |
++				    kIOMemoryPhysicallyContiguous, s->allocSize, page_size);
++			}
++			if (mem == NULL) {
++				mem = IOBufferMemoryDescriptor::inTaskWithOptions(kernel_task,
++				    kIODirectionInOut | kIOMemoryKernelUserShared, s->allocSize, page_size);
++			}
+ 		}
+ 		if (mem == NULL) {
+ 			OSAddAtomic64(-(SInt64)s->allocSize, (volatile SInt64 *)&sweet_surface_wired);
