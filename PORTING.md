@@ -24,7 +24,7 @@ Verified via ADB: Android 12 (`Q.1546350_1ab2a`), SPL 2024-01-05, ~6GB RAM,
 | arch_timer | PPI 13/14/11/10 → INTID 29/30/**27**/26; **13 MHz** (`0xc65d40`) |
 | UFS | `ufshci@0x11270000` size 0x2300, **GIC_SPI 105**, `mediatek,ufshci` |
 | CPUs | 6×A55 @~1.7GHz (`reg` 0x000–0x500) + 2×A76 @~2.17GHz (`0x600`,`0x700`) — **contiguous MPIDRs (core<<8)** |
-| Touch | The recovery live DT contains the project `oplus,tp_noflash` node on SPI4 (IRQ GPIO14, reset GPIO33); SPI4 is `mediatek,mt6765-spi`, and I2C5 declares push-pull signaling for its MT6360 LDO. The XNU bring-up config now uses enhanced SPI CFG2 timing and the DT's I2C mode. The NT36672C ID is still unconfirmed; the previous log showed SPI timeouts and I2C NACKs. |
+| Touch | Recovery confirms project 20686 selects `nt36672c_fhdp_dsi_vdo_dphy_jdi_120`; SPI4's `oppo,tp_noflash` device is bound to `novatek,nf_nt36672c` (mode 0), with IRQ GPIO14 and reset GPIO33. This confirms the NT36672C target and JDI firmware. XNU now tries native SPI4 CSB/pad-select 0 first, matching the stock Linux controller, and falls back to GPIO CS if detection fails. |
 | Panel | `nt35595_fhd_dsi_cmd_truly_nt50358` 1080×2400 (k6853v1_64 atag) |
 | bootargs | `console=ttyS0,921600n1` — MTK UART @ 921600 |
 

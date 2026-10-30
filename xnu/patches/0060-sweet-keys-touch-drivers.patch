@@ -292,13 +292,13 @@
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 --- /dev/null
 +++ b/bsd/dev/sweet_touch.c
-@@ -0,0 +1,979 @@
+@@ -0,0 +1,980 @@
 +/*
 + * SWEET MT6853 SPI4 / Novatek NT36672C (oplus tp_noflash) touch bring-up.
 + * RMX2117 wiring from the stock DTBO: spi4@11018000, irq GPIO14, reset
 + * GPIO33, SPI pins GPIO12=MI, GPIO13=MO, GPIO97=CLK, GPIO98=CSB (func2).
-+ * CS is bit-banged on GPIO98 (GPIO mode) so multi-packet messages keep one
-+ * CS window; the controller's own CSB pad is left unconnected.
++ * CS uses SPI4's native CSB (pad-select 0), matching the stock Linux driver.
++ * GPIO98 bit-banging remains a fallback if native-CS detection fails.
 + * NT36672C is a "noflash" TDDI: SRAM firmware must be host-downloaded on
 + * every boot, mirroring Download_Firmware_HW_CRC() in the OPLUS
 + * nvt_drivers_nt36672c_noflash.c vendor driver (FW_NF_NT36672C_JDI.img).
@@ -1175,13 +1175,12 @@
 +		goto out;
 +	}
 +
-+	/* pinmux: SPI4 pins f2; CSB is GPIO unless hw_cs fallback kicks in */
++	/* pinmux: SPI4 pins f2; prefer the native CSB used by the stock driver */
 +	gpio_mode(TP_PIN_MI, 2);
 +	gpio_mode(TP_PIN_MO, 2);
 +	gpio_mode(TP_PIN_CLK, 2);
-+	gpio_mode(TP_PIN_CSB, 0);
-+	gpio_dir(TP_PIN_CSB, true);
-+	gpio_out(TP_PIN_CSB, true);
++	st.hw_cs = true;
++	gpio_mode(TP_PIN_CSB, 2);
 +	gpio_mode(TP_PIN_IRQ, 0);
 +	gpio_dir(TP_PIN_IRQ, false);
 +	/* iocfg: input-enable on MI/IRQ, pull-up on IRQ (matches int_active) */
@@ -1206,10 +1205,12 @@
 +		detected = nvt_reset_and_detect(TP_PIN_RST2, id);
 +	}
 +	if (!detected) {
-+		/* last resort: let the hardware drive CSB itself */
-+		printf("SWEET TOUCH: retrying with hardware CSB\n");
-+		st.hw_cs = true;
-+		gpio_mode(TP_PIN_CSB, 2);
++		/* Preserve the pre-existing GPIO-CS path as a hardware fallback. */
++		printf("SWEET TOUCH: retrying with GPIO CSB\n");
++		st.hw_cs = false;
++		gpio_mode(TP_PIN_CSB, 0);
++		gpio_dir(TP_PIN_CSB, true);
++		gpio_out(TP_PIN_CSB, true);
 +		detected = nvt_reset_and_detect(TP_PIN_RST, id);
 +	}
 +	if (!detected) {
