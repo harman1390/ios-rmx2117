@@ -2,7 +2,7 @@ diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFrame
 index 742dd28..60cb306 100644
 --- a/iokit/Kernel/arm/SweetFramebuffer.cpp
 +++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
-@@ -48,9 +48,12 @@ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
+@@ -48,9 +48,13 @@ extern "C" int sweet_console_muted;     /* osfmk/console/serial_console.c */
  #include <IOKit/IOTimerEventSource.h>
  #include <IOKit/system.h>
  #include <pexpert/pexpert.h>
@@ -10,6 +10,7 @@ index 742dd28..60cb306 100644
  #include <kern/clock.h>
  #include <sys/proc.h>
  
++extern "C" vm_offset_t ml_io_map(vm_offset_t phys_addr, vm_size_t size);
 +extern "C" void flush_dcache64(addr64_t addr, unsigned count, int phys);
 +
  enum {
