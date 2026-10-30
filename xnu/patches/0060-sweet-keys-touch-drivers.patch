@@ -296,7 +296,7 @@
 +/*
 + * SWEET MT6853 SPI4 / Novatek NT36672C (oplus tp_noflash) touch bring-up.
 + * RMX2117 wiring from the stock DTBO: spi4@11018000, irq GPIO14, reset
-+ * GPIO43, SPI pins GPIO12=MI, GPIO13=MO, GPIO97=CLK, GPIO98=CSB (func2).
++ * GPIO33, SPI pins GPIO12=MI, GPIO13=MO, GPIO97=CLK, GPIO98=CSB (func2).
 + * CS is bit-banged on GPIO98 (GPIO mode) so multi-packet messages keep one
 + * CS window; the controller's own CSB pad is left unconnected.
 + * NT36672C is a "noflash" TDDI: SRAM firmware must be host-downloaded on
@@ -368,8 +368,8 @@
 +#define TP_PIN_CLK      97u   /* SPI4_CLK */
 +#define TP_PIN_CSB      98u   /* SPI4_CSB -> used as manual CS GPIO */
 +#define TP_PIN_IRQ      14u
-+#define TP_PIN_RST      43u   /* DTBO fragment@22 */
-+#define TP_PIN_RST2     33u   /* DTBO fragment@30 variant */
++#define TP_PIN_RST      33u   /* RMX2117 project 20611 touch node */
++#define TP_PIN_RST2     43u   /* alternate overlay variant */
 +#define TP_PIN_SCL      107u        /* SCL5 */
 +#define TP_PIN_SDA      108u        /* SDA5 */
 +#define TP_I2C_FUNC     1u
@@ -1171,10 +1171,10 @@
 +	    gpio_in(TP_PIN_IRQ), gpio_in(33), gpio_in(43),
 +	    gpio_in(TP_PIN_CSB), gpio_in(TP_PIN_MI));
 +
-+	/* two DTBO overlays disagree on the reset pin: try 43 then 33 */
++	/* Project 20611 uses GPIO33; retain GPIO43 as an alternate-overlay fallback. */
 +	bool detected = nvt_reset_and_detect(TP_PIN_RST, id);
 +	if (!detected) {
-+		printf("SWEET TOUCH: retrying with reset GPIO33\n");
++		printf("SWEET TOUCH: retrying with reset GPIO43\n");
 +		detected = nvt_reset_and_detect(TP_PIN_RST2, id);
 +	}
 +	if (!detected) {
