@@ -40,8 +40,11 @@ or push ios-rmx2117 to GitHub and run the `xnu` workflow.
 
     python tools/mkadt.py dtb/mt6853.adt --highmem       # already built
     python tools/mkpayload.py KERNEL dtb/mt6853.adt shim/out/payload.bin \
-      --cmdline 'debug=0xc serial=3 cpus=8 keepsyms=1 -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 wdt=-1 rootrw=1'
+      --cmdline 'debug=0xc serial=3 cpus=8 keepsyms=1 -noprogress rd=ufsroot0 unentitled_ios_sim_launch=1 wdt=-1 rootrw=1 sweetfb_noconsole=1'
     cd shim; build.bat out\payload.bin   # -> out/shim-boot.img
+
+`sweetfb_noconsole=1` prevents the kernel text console from drawing over the
+GUI after the first framebuffer swap. Keep it enabled when testing the GUI.
 
 MT6853 deltas vs the sweet cmdline: `cpus=8` (2xA76+6xA55, all verified),
 `rd=ufsroot0` naming TBD by the UFS driver, DSI cmd-mode panel needs a
