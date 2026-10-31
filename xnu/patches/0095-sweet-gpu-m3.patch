@@ -9,6 +9,7 @@
 +#include <sys/proc.h>
 +#include <sys/uio.h>
 +#include <miscfs/devfs/devfs.h>
++#include <miscfs/devfs/devfsdefs.h>
  #include <kern/clock.h>
 +#include <kern/locks.h>
  #include <kern/thread.h>
@@ -20,6 +21,7 @@
  		    g_as_mapped, g_cores_on);
 +	} else if (!rc && !g_nojob) {
 +		/* bring-up + self-test passed: stay powered and serve userland */
++		extern void sweet_gpu_devfs_register(void);
 +		sweet_gpu_devfs_register();
  	} else {
  		gpu_power_down();
@@ -203,6 +205,11 @@
 +/* ---- devfs entry points -------------------------------------------- */
 +
 +static int
++static void
++sgpu_as_release_cb(void)
++{
++}
++
 +sgpu_open(dev_t dev, int flags, int devtype, proc_t p)
 +{
 +	struct sgpu_as *as = NULL;
@@ -230,7 +237,7 @@
 +		lck_mtx_unlock(&sgpu_dev_lock);
 +		return EIO;
 +	}
-+	devfs_set_cdevpriv(as);
++	devfs_set_cdevpriv(as, sgpu_as_release_cb);
 +	lck_mtx_unlock(&sgpu_dev_lock);
 +	LOG("fd open: as%d\n", as->nr);
 +	return 0;
