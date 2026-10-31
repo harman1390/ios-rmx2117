@@ -968,7 +968,7 @@
 +static bool
 +nvt_write(uint8_t off, const uint8_t *data, unsigned n)
 +{
-+	uint8_t b[NVT_XFER_LEN + 1];
++	uint8_t b[NVT_XFER_LEN + 32];  /* +pad to a 32B wire multiple */
 +	if (n > NVT_XFER_LEN) {
 +		return false;
 +	}
