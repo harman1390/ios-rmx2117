@@ -15,10 +15,12 @@
  #include <kern/thread.h>
  #include <kern/sched_prim.h>
  #include <machine/machine_routines.h>
-@@ -916,6 +922,10 @@
+@@ -916,6 +922,12 @@
  	if (g_keep) {
  		LOG("sweetgpu_keep=1: leaving GPU powered, as0=%d cores=%d\n",
  		    g_as_mapped, g_cores_on);
++		extern void sweet_gpu_devfs_register(void);
++		sweet_gpu_devfs_register();
 +	} else if (!rc && !g_nojob) {
 +		/* bring-up + self-test passed: stay powered and serve userland */
 +		extern void sweet_gpu_devfs_register(void);
