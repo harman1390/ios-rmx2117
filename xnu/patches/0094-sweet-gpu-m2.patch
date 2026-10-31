@@ -1,6 +1,6 @@
 --- a/bsd/dev/sweet_gpu.c
 +++ b/bsd/dev/sweet_gpu.c
-@@ -1,261 +1,957 @@
+@@ -1,261 +1,963 @@
 -/*
 - * SWEET Mali-G57 (MT6853) milestone M1: power the MFG domains, ungate the
 - * mfgcfg clock and read GPU_ID.  Every register/sequence below is from
