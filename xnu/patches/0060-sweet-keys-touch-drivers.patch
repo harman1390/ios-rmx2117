@@ -292,7 +292,7 @@
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 --- /dev/null
 +++ b/bsd/dev/sweet_touch.c
-@@ -0,0 +1,1157 @@
+@@ -0,0 +1,1155 @@
 +/*
 + * SWEET MT6853 SPI4 / Novatek NT36672C (oplus tp_noflash) touch bring-up.
 + * RMX2117 wiring from the stock DTBO: spi4@11018000, irq GPIO14, reset
@@ -921,11 +921,9 @@
 +		spi_drain_rxd(rx ? rx + off : NULL, n);
 +		off += n;
 +		if (off >= len) {
-+			if (f == 1 && !spi_done()) {
-+				printf("SWEET TOUCH: spi tail timeout st0=%#x st1=%#x\n",
-+				    trd(st.spi, SPI_ST0), trd(st.spi, SPI_ST1));
-+				return false;
-+			}
++			/* vendor finalizes on the last packet's pause: once the
++			 * final bytes are drained the transfer is complete -- no
++			 * FINISH wait (it only arrives after another RESUME). */
 +			return true;
 +		}
 +		unsigned m = len - off;
