@@ -1,6 +1,34 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -58,6 +58,7 @@
+ extern void sweet_conn_init(void);
+ extern void sweet_batt_init(void);
+ extern void sweet_torch_init(void);
++extern void sweet_cam_init(void);
+ 
+ #define REG_CAP         0x00
+ #define REG_IS          0x20
+@@ -691,6 +692,7 @@
+ 	 * probe (each boot-arg gated; see SWEET *: log lines). */
+ 	sweet_batt_init();
+ 	sweet_torch_init();
++	sweet_cam_init();
+ 	return 0;
+ }
+ 
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -116,6 +116,7 @@
+ bsd/dev/sweet_conn.c			standard
+ bsd/dev/sweet_batt.c			standard
+ bsd/dev/sweet_torch.c			standard
++bsd/dev/sweet_cam.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
 --- /dev/null
 +++ b/bsd/dev/sweet_cam.c
-@@ -0,0 +1,348 @@
+@@ -0,0 +1,350 @@
 +/*
 + * SWEET camera probe for RMX2117 (MT6853) -- probe level only.
 + *
@@ -41,7 +69,7 @@
 +#define CAM_I2C2_PA     0x11d21000u
 +#define CAM_I2C2_DMA_PA 0x10217180u
 +#define CAM_IMPWS_PA    0x11d23000u /* imp_iic_wrap_ws gate block */
-+#define CAM_IMPWS_I2C2  (1u << 1)   /* gate idx: i2c1=0, i2c2=1, i2c4=2 */
++#define CAM_IMPWS_I2C2  (1u << 1)   /* CLK_IMPWS_AP_CLOCK_RO_I2C2 = 1 */
 +#define CAM_GPIO_PA     0x10005000u
 +#define CAM_IOC_BR_PA   0x11d40000u
 +#define CAM_PWRAP_PA    0x10026000u
@@ -239,13 +267,15 @@
 +	w32(g_impws, 0xe04, CAM_IMPWS_I2C2);
 +	printf("SWEET CAM: impws sta=%#x\n", r32(g_impws, 0xe00));
 +
-+	/* CCI pins: i2c func + input-enable + pull-up in iocfg BR */
++	/* CCI pins: i2c func + input-enable + pull-up in iocfg BR.
++	 * Vendor pinctrl-mt6853.c pin_field tables (base5=0x11d40000):
++	 * pin101 -> bit3, pin102 -> bit7 at IES(0x70)/PU(0xb0)/PD(0x90). */
 +	gpio_mode(PIN_CAM_SCL, PIN_I2C_FUNC);
 +	gpio_mode(PIN_CAM_SDA, PIN_I2C_FUNC);
 +	volatile uint32_t *ioc = (volatile uint32_t *)g_ioc;
-+	ioc[0x0070 / 4] |= (3u << 9);   /* IES pins 101,102 (bits 9,10) */
-+	ioc[0x00b0 / 4] |= (3u << 9);   /* PU */
-+	ioc[0x0090 / 4] &= ~(3u << 9);  /* PD off */
++	ioc[0x0070 / 4] |= (1u << 3) | (1u << 7);   /* IES 101,102 */
++	ioc[0x00b0 / 4] |= (1u << 3) | (1u << 7);   /* PU   101,102 */
++	ioc[0x0090 / 4] &= ~((1u << 3) | (1u << 7));/* PD   101,102 off */
 +
 +	/* i2c2 init (same as i2c5 bring-up) */
 +	i2cw(I2C_START, 0);
