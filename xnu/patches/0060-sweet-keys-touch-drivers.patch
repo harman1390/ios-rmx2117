@@ -292,7 +292,7 @@
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 --- /dev/null
 +++ b/bsd/dev/sweet_touch.c
-@@ -0,0 +1,1135 @@
+@@ -0,0 +1,1133 @@
 +/*
 + * SWEET MT6853 SPI4 / Novatek NT36672C (oplus tp_noflash) touch bring-up.
 + * RMX2117 wiring from the stock DTBO: spi4@11018000, irq GPIO14, reset
@@ -665,15 +665,13 @@
 +static bool
 +spi_config(void)
 +{
-+	/* spi_sel mux -> index0 (26M xtal, always-on); log old src first */
++	/* Keep LK's spi_sel parent: the previous build forced idx0 on the
++	 * assumption it was the 26 MHz xtal -- unverified, and a dead mux
++	 * parent starves the shift clock exactly like the st1=0x1 busy
++	 * stalls we keep seeing. Just log what LK left. */
 +	uint32_t cfg6 = trd(st.topck, TP_CLK_CFG6);
 +	printf("SWEET TOUCH: spi_sel mux cfg6=%#x (idx=%u)\n",
 +	    cfg6, (cfg6 >> TP_SPI_SEL_LSB) & 3u);
-+	twr(st.topck, TP_CLK_CFG6_CLR, 3u << TP_SPI_SEL_LSB);
-+	twr(st.topck, TP_CLK_CFG6_SET, 0u << TP_SPI_SEL_LSB);
-+	twr(st.topck, TP_CLK_CFG_UPD, TP_MUX_SPI_UPD);
-+	printf("SWEET TOUCH: spi_sel mux now=%#x\n",
-+	    trd(st.topck, TP_CLK_CFG6));
 +
 +	/* ungate SPI4 bus clock (IFRAO4 bit25) */
 +	twr(st.infra, TP_SPI4_CG_CLR, TP_SPI4_CG_BIT);
