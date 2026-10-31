@@ -1,13 +1,3 @@
---- a/bsd/conf/files
-+++ b/bsd/conf/files
-@@ -114,6 +114,7 @@
- bsd/dev/sweet_nvt_fw.c			standard
- bsd/dev/sweet_gpu.c			standard
- bsd/dev/sweet_conn.c			standard
-+bsd/dev/sweet_batt.c			standard
- bsd/dev/mem.c				standard
- bsd/dev/munge.c 			optional config_requires_u32_munging
- bsd/dev/unix_startup.c			standard
 --- /dev/null
 +++ b/bsd/dev/sweet_batt.c
 @@ -0,0 +1,286 @@
