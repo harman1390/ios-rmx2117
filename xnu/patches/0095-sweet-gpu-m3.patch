@@ -26,7 +26,7 @@
  	} else {
  		gpu_power_down();
  		LOG("teardown complete (rc=%d)\n", rc);
-@@ -954,4 +963,388 @@
+@@ -954,4 +963,389 @@
  	else
  		LOG("kernel_thread_start failed %d\n", kr);
  }
@@ -115,7 +115,8 @@
 +	vm_offset_t va;
 +	if (as->pt_used >= SGPU_PT_POOL)
 +		return -1;
-+	if (kmem_alloc(kernel_map, &va, 0x1000) != KERN_SUCCESS)
++	if (kmem_alloc(kernel_map, &va, 0x1000,
++	    KMA_DATA, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS)
 +		return -1;
 +	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)va);
 +	if (!pn) {
