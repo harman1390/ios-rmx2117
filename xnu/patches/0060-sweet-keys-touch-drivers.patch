@@ -292,7 +292,7 @@
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 --- /dev/null
 +++ b/bsd/dev/sweet_touch.c
-@@ -0,0 +1,1121 @@
+@@ -0,0 +1,1157 @@
 +/*
 + * SWEET MT6853 SPI4 / Novatek NT36672C (oplus tp_noflash) touch bring-up.
 + * RMX2117 wiring from the stock DTBO: spi4@11018000, irq GPIO14, reset
@@ -841,70 +841,106 @@
 + * by the caller. tx/rx may be NULL (sends 0x00 / discards). Byte packing:
 + * little-endian word writes, matching iowrite32_rep in spi-mt65xx.
 + */
++static unsigned
++spi_wait_flag(void)
++{
++	for (unsigned i = 0; i < 40000; ++i) {
++		uint32_t s = trd(st.spi, SPI_ST0);
++		if (s & SPI_ST0_FINISH) {
++			return 2;
++		}
++		if ((s & SPI_ST0_PAUSE) || (trd(st.spi, SPI_ST1) & 1u)) {
++			return 1;
++		}
++	}
++	return 0;
++}
++
++static void
++spi_fill_txd(const uint8_t *tx, unsigned n)
++{
++	unsigned i = 0;
++	while (i + 4u <= n) {
++		uint32_t v = 0;
++		for (unsigned b = 0; b < 4; ++b) {
++			v |= (uint32_t)(tx ? tx[i + b] : 0) << (8 * b);
++		}
++		twr(st.spi, SPI_TXD, v);
++		i += 4;
++	}
++	if (i < n) {
++		uint32_t v = 0;
++		for (unsigned b = 0; i + b < n; ++b) {
++			v |= (uint32_t)(tx ? tx[i + b] : 0) << (8 * b);
++		}
++		twr(st.spi, SPI_TXD, v);
++	}
++}
++
++static void
++spi_drain_rxd(uint8_t *rx, unsigned n)
++{
++	unsigned i = 0;
++	while (i < n) {
++		uint32_t v = trd(st.spi, SPI_RXD);
++		if (rx) {
++			for (unsigned b = 0; b < 4 && i + b < n; ++b) {
++				rx[i + b] = (uint8_t)(v >> (8 * b));
++			}
++		}
++		i += 4;
++	}
++}
++
++/* Vendor IRQ flow: each 32B packet ends in a PAUSE -- drain RXD, refill
++ * TXD, RESUME; the last packet ends in FINISH.  Resuming without the
++ * drain leaves the engine parked (st1 busy, st0=0) -- the stalls we saw
++ * landed exactly on packet boundaries. */
 +static bool
 +spi_xfer(const uint8_t *tx, uint8_t *rx, unsigned len)
 +{
 +	unsigned off = 0;
-+	/* DMA path needs the SMI larb AHB port which LK never powers; with
-+	 * LK's real clock parent kept, plain <=32B FIFO packets are enough
-+	 * (the earlier chunk stalls were the same dead-mux-parent bug). */
++	unsigned n = len > SPI_FIFO ? SPI_FIFO : len;
++	uint32_t c1 = trd(st.spi, SPI_CFG1);
++	c1 = (c1 & ~0x3ffff00u) | ((n - 1u) << 16);
++	twr(st.spi, SPI_CFG1, c1);
 +	twr(st.spi, SPI_CMD, trd(st.spi, SPI_CMD) | SPI_RST);
 +	twr(st.spi, SPI_CMD, trd(st.spi, SPI_CMD) & ~SPI_RST);
++	twr(st.spi, SPI_ST0, trd(st.spi, SPI_ST0)); /* w1c */
++	spi_fill_txd(tx, n);
++	twr(st.spi, SPI_CMD, trd(st.spi, SPI_CMD) | SPI_ACT);
 +	while (off < len) {
-+		unsigned n = len - off;
-+		if (n > SPI_FIFO) {
-+			n = SPI_FIFO;
-+		}
-+		/* packet = n bytes, single loop; keep cs_idle (bits0-7) */
-+		uint32_t c1 = trd(st.spi, SPI_CFG1);
-+		c1 = (c1 & ~0x3ffff00u) | ((n - 1u) << 16);
-+		twr(st.spi, SPI_CFG1, c1);
-+		/* fill TX fifo */
-+		unsigned i = 0;
-+		while (i + 4u <= n) {
-+			uint32_t v = 0;
-+			for (unsigned b = 0; b < 4; ++b) {
-+				v |= (uint32_t)(tx ? tx[off + i + b] : 0) << (8 * b);
-+			}
-+			twr(st.spi, SPI_TXD, v);
-+			i += 4;
-+		}
-+		if (i < n) {
-+			uint32_t v = 0;
-+			for (unsigned b = 0; i + b < n; ++b) {
-+				v |= (uint32_t)(tx ? tx[off + i + b] : 0) << (8 * b);
-+			}
-+			twr(st.spi, SPI_TXD, v);
-+		}
-+		twr(st.spi, SPI_ST0, trd(st.spi, SPI_ST0)); /* w1c */
-+		twr(st.spi, SPI_CMD, trd(st.spi, SPI_CMD) | SPI_ACT);
-+		if (!spi_done()) {
-+			printf("SWEET TOUCH: spi finish timeout off=%u n=%u len=%u st0=%#x st1=%#x cfg1=%#x cmd=%#x\n",
-+			    off, n, len, trd(st.spi, SPI_ST0),
++		unsigned f = spi_wait_flag();
++		if (f == 0) {
++			printf("SWEET TOUCH: spi flag timeout off=%u len=%u st0=%#x st1=%#x cfg1=%#x cmd=%#x\n",
++			    off, len, trd(st.spi, SPI_ST0),
 +			    trd(st.spi, SPI_ST1), trd(st.spi, SPI_CFG1),
 +			    trd(st.spi, SPI_CMD));
 +			return false;
 +		}
-+		/* drain RX fifo */
-+		i = 0;
-+		while (i + 4u <= n) {
-+			uint32_t v = trd(st.spi, SPI_RXD);
-+			if (rx) {
-+				for (unsigned b = 0; b < 4; ++b) {
-+					rx[off + i + b] = (uint8_t)(v >> (8 * b));
-+				}
-+			}
-+			i += 4;
-+		}
-+		if (i < n) {
-+			uint32_t v = trd(st.spi, SPI_RXD);
-+			if (rx) {
-+				for (unsigned b = 0; i + b < n; ++b) {
-+					rx[off + i + b] = (uint8_t)(v >> (8 * b));
-+				}
-+			}
-+		}
++		spi_drain_rxd(rx ? rx + off : NULL, n);
 +		off += n;
++		if (off >= len) {
++			if (f == 1 && !spi_done()) {
++				printf("SWEET TOUCH: spi tail timeout st0=%#x st1=%#x\n",
++				    trd(st.spi, SPI_ST0), trd(st.spi, SPI_ST1));
++				return false;
++			}
++			return true;
++		}
++		unsigned m = len - off;
++		if (m > SPI_FIFO) {
++			m = SPI_FIFO;
++		}
++		if (m != n) {
++			n = m;
++			c1 = (trd(st.spi, SPI_CFG1) & ~0x3ffff00u) |
++			    ((n - 1u) << 16);
++			twr(st.spi, SPI_CFG1, c1);
++		}
++		spi_fill_txd(tx ? tx + off : NULL, n);
++		twr(st.spi, SPI_ST0, trd(st.spi, SPI_ST0)); /* w1c */
++		twr(st.spi, SPI_CMD, trd(st.spi, SPI_CMD) | SPI_RESUME);
 +	}
 +	return true;
 +}
