@@ -292,7 +292,7 @@
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 --- /dev/null
 +++ b/bsd/dev/sweet_touch.c
-@@ -0,0 +1,1210 @@
+@@ -0,0 +1,1192 @@
 +/*
 + * SWEET MT6853 SPI4 / Novatek NT36672C (oplus tp_noflash) touch bring-up.
 + * RMX2117 wiring from the stock DTBO: spi4@11018000, irq GPIO14, reset
@@ -894,31 +894,37 @@
 +	}
 +}
 +
-+/* Vendor IRQ flow: each 32B packet ends in a PAUSE -- drain RXD, refill
-+ * TXD, RESUME; the last packet ends in FINISH.  Resuming without the
-+ * drain leaves the engine parked (st1 busy, st0=0) -- the stalls we saw
-+ * landed exactly on packet boundaries. */
++/* Deterministic transport: every <=32B packet is a complete transfer
++ * inside one CS window -- RST forces the engine to a known-idle state
++ * before each ACT, so no RESUME/continuation semantics are needed and
++ * the st1 flag can't race the drain/refill path. */
 +static bool
 +spi_xfer(const uint8_t *tx, uint8_t *rx, unsigned len)
 +{
-+	unsigned off = 0;
-+	unsigned n = len > SPI_FIFO ? SPI_FIFO : len;
-+	uint32_t c1 = trd(st.spi, SPI_CFG1);
-+	c1 = (c1 & ~0x3ffff00u) | ((n - 1u) << 16);
-+	twr(st.spi, SPI_CFG1, c1);
-+	twr(st.spi, SPI_CMD, trd(st.spi, SPI_CMD) | SPI_RST);
-+	twr(st.spi, SPI_CMD, trd(st.spi, SPI_CMD) & ~SPI_RST);
-+	twr(st.spi, SPI_ST0, trd(st.spi, SPI_ST0)); /* w1c */
-+	spi_fill_txd(tx, n);
-+	twr(st.spi, SPI_CMD, trd(st.spi, SPI_CMD) | SPI_ACT);
 +	static unsigned dbg = 0;
++	unsigned off = 0;
 +	while (off < len) {
-+		unsigned f = spi_wait_flag();
-+		if (dbg < 6 && len > SPI_FIFO) {
-+			printf("SWEET TOUCH: spi pkt off=%u f=%u st0=%#x st1=%#x\n",
-+			    off, f, trd(st.spi, SPI_ST0), trd(st.spi, SPI_ST1));
-+			dbg++;
++		unsigned n = len - off;
++		if (n > SPI_FIFO) {
++			n = SPI_FIFO;
 +		}
++		uint32_t c1 = trd(st.spi, SPI_CFG1);
++		c1 = (c1 & ~0x3ffff00u) | ((n - 1u) << 16);
++		twr(st.spi, SPI_CFG1, c1);
++		twr(st.spi, SPI_CMD, trd(st.spi, SPI_CMD) | SPI_RST);
++		twr(st.spi, SPI_CMD, trd(st.spi, SPI_CMD) & ~SPI_RST);
++		/* if the engine is parked from a previous packet, free it */
++		if (trd(st.spi, SPI_ST1) & 1u) {
++			twr(st.spi, SPI_CMD, trd(st.spi, SPI_CMD) | SPI_RESUME);
++			if (dbg < 6 && len > SPI_FIFO) {
++				printf("SWEET TOUCH: spi unpause off=%u\n", off);
++				dbg++;
++			}
++		}
++		twr(st.spi, SPI_ST0, trd(st.spi, SPI_ST0)); /* w1c */
++		spi_fill_txd(tx ? tx + off : NULL, n);
++		twr(st.spi, SPI_CMD, trd(st.spi, SPI_CMD) | SPI_ACT);
++		unsigned f = spi_wait_flag();
 +		if (f == 0) {
 +			printf("SWEET TOUCH: spi flag timeout off=%u len=%u st0=%#x st1=%#x cfg1=%#x cmd=%#x\n",
 +			    off, len, trd(st.spi, SPI_ST0),
@@ -928,30 +934,6 @@
 +		}
 +		spi_drain_rxd(rx ? rx + off : NULL, n);
 +		off += n;
-+		if (off >= len) {
-+			/* vendor finalizes on the last packet's pause: once the
-+			 * final bytes are drained the transfer is complete -- no
-+			 * FINISH wait (it only arrives after another RESUME). */
-+			return true;
-+		}
-+		unsigned m = len - off;
-+		if (m > SPI_FIFO) {
-+			m = SPI_FIFO;
-+		}
-+		if (m != n) {
-+			n = m;
-+			c1 = (trd(st.spi, SPI_CFG1) & ~0x3ffff00u) |
-+			    ((n - 1u) << 16);
-+			twr(st.spi, SPI_CFG1, c1);
-+		}
-+		spi_fill_txd(tx ? tx + off : NULL, n);
-+		twr(st.spi, SPI_ST0, trd(st.spi, SPI_ST0)); /* w1c */
-+		/* vendor state machine: RESUME only continues a PAUSED engine;
-+		 * after FINISH it is idle and needs a fresh ACT.  Resuming an
-+		 * idle engine replays/skips the last packet -> deterministic
-+		 * corruption past the first 32 bytes (the CRC failures). */
-+		twr(st.spi, SPI_CMD, trd(st.spi, SPI_CMD) |
-+		    (f == 1 ? SPI_RESUME : SPI_ACT));
 +	}
 +	return true;
 +}
