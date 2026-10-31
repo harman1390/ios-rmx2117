@@ -292,7 +292,7 @@
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 --- /dev/null
 +++ b/bsd/dev/sweet_touch.c
-@@ -0,0 +1,1205 @@
+@@ -0,0 +1,1210 @@
 +/*
 + * SWEET MT6853 SPI4 / Novatek NT36672C (oplus tp_noflash) touch bring-up.
 + * RMX2117 wiring from the stock DTBO: spi4@11018000, irq GPIO14, reset
@@ -946,7 +946,12 @@
 +		}
 +		spi_fill_txd(tx ? tx + off : NULL, n);
 +		twr(st.spi, SPI_ST0, trd(st.spi, SPI_ST0)); /* w1c */
-+		twr(st.spi, SPI_CMD, trd(st.spi, SPI_CMD) | SPI_RESUME);
++		/* vendor state machine: RESUME only continues a PAUSED engine;
++		 * after FINISH it is idle and needs a fresh ACT.  Resuming an
++		 * idle engine replays/skips the last packet -> deterministic
++		 * corruption past the first 32 bytes (the CRC failures). */
++		twr(st.spi, SPI_CMD, trd(st.spi, SPI_CMD) |
++		    (f == 1 ? SPI_RESUME : SPI_ACT));
 +	}
 +	return true;
 +}
