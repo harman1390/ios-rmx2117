@@ -292,7 +292,7 @@
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 --- /dev/null
 +++ b/bsd/dev/sweet_touch.c
-@@ -0,0 +1,1125 @@
+@@ -0,0 +1,1133 @@
 +/*
 + * SWEET MT6853 SPI4 / Novatek NT36672C (oplus tp_noflash) touch bring-up.
 + * RMX2117 wiring from the stock DTBO: spi4@11018000, irq GPIO14, reset
@@ -796,8 +796,14 @@
 +	twr(st.spi, SPI_ST0, trd(st.spi, SPI_ST0)); /* w1c */
 +	twr(st.spi, SPI_CMD, (cmd & ~SPI_RESUME) | SPI_ACT);
 +	if (!spi_done()) {
-+		printf("SWEET TOUCH: spi dma timeout st0=%#x cmd=%#x len=%u\n",
-+		    trd(st.spi, SPI_ST0), trd(st.spi, SPI_CMD), len);
++		printf("SWEET TOUCH: spi dma timeout len=%u txpa=%#llx rxpa=%#llx st0=%#x st1=%#x cfg1=%#x cmd=%#x\n",
++		    len,
++		    tx ? (unsigned long long)((uint64_t)trd(st.spi, SPI_TX_SRC_64) << 32 |
++		        trd(st.spi, SPI_TX_SRC)) : 0ull,
++		    rx ? (unsigned long long)((uint64_t)trd(st.spi, SPI_RX_DST_64) << 32 |
++		        trd(st.spi, SPI_RX_DST)) : 0ull,
++		    trd(st.spi, SPI_ST0), trd(st.spi, SPI_ST1),
++		    trd(st.spi, SPI_CFG1), trd(st.spi, SPI_CMD));
 +		twr(st.spi, SPI_CMD,
 +		    trd(st.spi, SPI_CMD) & ~(SPI_CMD_TX_DMA | SPI_CMD_RX_DMA));
 +		return false;
@@ -885,8 +891,10 @@
 +		twr(st.spi, SPI_ST0, trd(st.spi, SPI_ST0)); /* w1c */
 +		twr(st.spi, SPI_CMD, trd(st.spi, SPI_CMD) | SPI_ACT);
 +		if (!spi_done()) {
-+			printf("SWEET TOUCH: spi finish timeout st0=%#x cmd=%#x\n",
-+			    trd(st.spi, SPI_ST0), trd(st.spi, SPI_CMD));
++			printf("SWEET TOUCH: spi finish timeout off=%u n=%u len=%u st0=%#x st1=%#x cfg1=%#x cmd=%#x\n",
++			    off, n, len, trd(st.spi, SPI_ST0),
++			    trd(st.spi, SPI_ST1), trd(st.spi, SPI_CFG1),
++			    trd(st.spi, SPI_CMD));
 +			return false;
 +		}
 +		/* drain RX fifo */
