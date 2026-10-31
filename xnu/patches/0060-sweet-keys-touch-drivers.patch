@@ -292,7 +292,7 @@
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 --- /dev/null
 +++ b/bsd/dev/sweet_touch.c
-@@ -0,0 +1,1009 @@
+@@ -0,0 +1,1012 @@
 +/*
 + * SWEET MT6853 SPI4 / Novatek NT36672C (oplus tp_noflash) touch bring-up.
 + * RMX2117 wiring from the stock DTBO: spi4@11018000, irq GPIO14, reset
@@ -742,8 +742,11 @@
 +	twr(st.spi, SPI_CMD, trd(st.spi, SPI_CMD) & ~SPI_RST);
 +	while (off < len) {
 +		unsigned n = len - off;
-+		if (n > SPI_FIFO) {
-+			n = SPI_FIFO;
++		/* RX FIFO is 32B and is only drained after a packet; cap each
++		 * packet so full-duplex MISO can never fill it mid-transfer
++		 * (st0=0 finish timeouts seen on 257-byte fw writes). */
++		if (n > 24u) {
++			n = 24u;
 +		}
 +		/* packet = n bytes, single loop; keep cs_idle (bits0-7) */
 +		uint32_t c1 = trd(st.spi, SPI_CFG1);
