@@ -292,7 +292,7 @@
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 --- /dev/null
 +++ b/bsd/dev/sweet_touch.c
-@@ -0,0 +1,1193 @@
+@@ -0,0 +1,1205 @@
 +/*
 + * SWEET MT6853 SPI4 / Novatek NT36672C (oplus tp_noflash) touch bring-up.
 + * RMX2117 wiring from the stock DTBO: spi4@11018000, irq GPIO14, reset
@@ -976,8 +976,20 @@
 +	for (unsigned i = 0; i < n; ++i) {
 +		b[1 + i] = data[i];
 +	}
++	/* engine packet tails: pad to a 32-byte multiple -- a <4-byte tail
++	 * packet either never runs or sends stale bytes (per-chunk CRC
++	 * mismatch); pad bytes spill into the next chunk's region which the
++	 * following write overwrites anyway. */
++	unsigned wire = n + 1;
++	if (wire > SPI_FIFO && (wire & 31u)) {
++		unsigned pad = 32u - (wire & 31u);
++		for (unsigned i = 0; i < pad; ++i) {
++			b[wire + i] = 0;
++		}
++		wire += pad;
++	}
 +	tp_cs(true);
-+	bool ok = spi_xfer(b, NULL, n + 1);
++	bool ok = spi_xfer(b, NULL, wire);
 +	tp_cs(false);
 +	return ok;
 +}
