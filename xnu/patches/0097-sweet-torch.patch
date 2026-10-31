@@ -1,0 +1,342 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -57,6 +57,7 @@
+ extern void sweet_gpu_init(void);
+ extern void sweet_conn_init(void);
+ extern void sweet_batt_init(void);
++extern void sweet_torch_init(void);
+ 
+ #define REG_CAP         0x00
+ #define REG_IS          0x20
+@@ -691,6 +692,7 @@
+ 	/* Peripheral drivers: battery service, torch, camera probe, mic
+ 	 * probe (each boot-arg gated; see SWEET *: log lines). */
+ 	sweet_batt_init();
++	sweet_torch_init();
+ 	return 0;
+ }
+ 
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -115,6 +115,7 @@
+ bsd/dev/sweet_gpu.c			standard
+ bsd/dev/sweet_conn.c			standard
+ bsd/dev/sweet_batt.c			standard
++bsd/dev/sweet_torch.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- /dev/null
++++ b/bsd/dev/sweet_torch.c
+@@ -0,0 +1,311 @@
++/*
++ * SWEET torch/flashlight driver for RMX2117 (MT6853).
++ *
++ * The board's `flashlights_mt6360` node is the MT6360 sub-PMIC FLED
++ * (flash LED) block.  MT6360 sits on i2c5 (0x11d00000) slave 0x64 --
++ * the same bus/slave sweet_touch.c already uses for the VTP LDO, so
++ * the i2c5 master stack below is copied verbatim from there (vendor
++ * mtk-i2c v6 register layout, MT6360 crc8(0x07) framing).
++ *
++ * FLED registers (vendor drivers/misc/mediatek/pmic/mt6360/
++ * inc/mt6360_pmu.h, pmu/mt6360_pmu_fled.c):
++ *   MT6360_PMU_FLED_CFG       0x70
++ *   MT6360_PMU_FLED1_TOR_CTRL 0x75  -- low5 ITOR current level
++ *   MT6360_PMU_FLED2_TOR_CTRL 0x79  -- low5 ITOR current level
++ *   MT6360_PMU_FLED_EN        0x7E  -- bit0 FLCS2_EN, bit1 FLCS1_EN,
++ *                                      bit3 FL_TORCH (torch mode)
++ *   MT6360_PMU_FLED_STAT1/2   0xE9/0xEA -- fault status
++ *
++ * Torch on:  write ITOR level (0-31), then FLED_EN |= 0x0b.
++ * Torch off: FLED_EN &= ~0x0b.
++ * Interface: sysctl kern.sweettorch (0=off, 1..31=on at that level) and
++ * /dev/sweettorch write("0".."31").  Boot-arg sweettorch=1 (default on:
++ * no writes happen until a user sets a level).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/conf.h>
++#include <sys/uio.h>
++#include <sys/proc.h>
++#include <sys/sysctl.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++void sweet_torch_init(void);
++
++#define TOR_I2C5_PA     0x11d00000u /* i2c5 controller */
++#define TOR_I2C5_DMA_PA 0x10217500u /* i2c5 DMA/reset block */
++#define TOR_IMPIIC_PA   0x11d04000u /* imp_iic_wrap_s gate: sta e00/clr e04 */
++#define TOR_IMPIIC_CG   (1u << 0)   /* CLK_IMPS_AP_CLOCK_RO_I2C5 */
++#define TOR_GPIO_PA     0x10005000u
++#define PIN_I2C5_SCL    107u
++#define PIN_I2C5_SDA    108u
++#define PIN_I2C5_FUNC   1u
++#define MT6360_ADDR     0x64u       /* same sub-PMIC touch uses */
++#define MT6360_FLED1_TOR 0x75u
++#define MT6360_FLED2_TOR 0x79u
++#define MT6360_FLED_EN   0x7eu
++#define MT6360_FLED_STAT1 0xe9u
++#define FLED_ON       0x0bu       /* FLCS1_EN|FLCS2_EN|FL_TORCH */
++#define FLED_MASK     0x1fu
++
++/* mtk i2c v6 regs (16-bit) -- identical layout to sweet_touch.c */
++#define I2C_DATA      0x00u
++#define I2C_SLAVE     0x04u
++#define I2C_ISTAT     0x0cu
++#define I2C_CONTROL   0x10u
++#define I2C_XFER_LEN  0x14u
++#define I2C_TRANS_LEN 0x18u
++#define I2C_DELAY     0x1cu
++#define I2C_TIMING    0x20u
++#define I2C_START     0x24u
++#define I2C_EXT_CONF  0x28u
++#define I2C_FIFO_CLR  0x38u
++#define I2C_IOCFG     0x40u
++#define I2C_HS        0x48u
++#define I2C_SOFTRST   0x50u
++#define I2C_DCM_EN    0x54u
++#define I2C_XFER_AUX  0x6cu
++#define CTL_RS        0x02u
++#define CTL_CLK_EXT   0x08u
++#define CTL_DIR_CHG   0x10u
++#define CTL_ACKERR    0x20u
++
++static vm_offset_t g_i2c, g_i2c_dma, g_impiic, g_gpio;
++static int g_started, g_ready, g_level;
++static void *g_node;
++
++static uint32_t
++grd32(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++gwr32(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++static uint16_t
++i2cr(uint32_t off)
++{
++	return *(volatile uint16_t *)(g_i2c + off);
++}
++
++static void
++i2cw(uint32_t off, uint16_t v)
++{
++	*(volatile uint16_t *)(g_i2c + off) = v;
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++static void
++gpio_mode(unsigned pin, unsigned func)
++{
++	volatile uint32_t *mode =
++	    (volatile uint32_t *)(g_gpio + 0x0300 + (pin / 8u) * 0x10u);
++	*mode = (*mode & ~(0xfu << ((pin & 7u) * 4u))) |
++	    (func << ((pin & 7u) * 4u));
++	__asm__ volatile("dsb osh" ::: "memory");
++}
++
++/* MT6360 i2c frames carry a crc8(0x07) over (addr<<1)|reg|data */
++static uint8_t
++crc8_07(const uint8_t *d, unsigned n)
++{
++	uint8_t c = 0;
++	while (n--) {
++		c ^= *d++;
++		for (int i = 0; i < 8; i++)
++			c = (c & 0x80u) ? (uint8_t)((c << 1) ^ 0x07u)
++			    : (uint8_t)(c << 1);
++	}
++	return c;
++}
++
++static uint16_t
++i2c5_xfer(uint8_t addr, const uint8_t *wr, unsigned wlen, uint8_t *rd,
++    unsigned rlen)
++{
++	uint16_t ctl = CTL_ACKERR | CTL_CLK_EXT;
++	unsigned i, spins = 200000;
++	uint16_t s = 0;
++	if (rlen)
++		ctl |= CTL_DIR_CHG | CTL_RS;
++	else
++		i2cw(I2C_DELAY, 0x0002);
++	i2cw(I2C_CONTROL, ctl);
++	i2cw(I2C_SLAVE, (uint16_t)(addr << 1));
++	i2cw(I2C_ISTAT, 0x0007);
++	i2cw(I2C_FIFO_CLR, 0x0001);
++	i2cw(I2C_XFER_LEN, (uint16_t)wlen);
++	i2cw(I2C_XFER_AUX, (uint16_t)rlen);
++	i2cw(I2C_TRANS_LEN, rlen ? 0x0002u : 0x0001u);
++	for (i = 0; i < wlen; i++)
++		i2cw(I2C_DATA, wr[i]);
++	i2cw(I2C_START, 0x0001);
++	while (spins-- && !((s = i2cr(I2C_ISTAT)) & 0x0007))
++		delay(1);
++	for (i = 0; rd && i < rlen; i++)
++		rd[i] = (uint8_t)i2cr(I2C_DATA);
++	return s;
++}
++
++static int
++mt6360_wr(uint8_t reg, uint8_t val)
++{
++	uint8_t f[4] = { reg & 0x3fu, val, 0, 0 };
++	uint8_t c[3] = { (uint8_t)(MT6360_ADDR << 1), f[0], f[1] };
++	f[2] = crc8_07(c, 3);
++	return (i2c5_xfer(MT6360_ADDR, f, 4, NULL, 0) & 7u) == 1u ? 0 : -1;
++}
++
++static int
++mt6360_rd(uint8_t reg)
++{
++	uint8_t f[1] = { reg & 0x3fu };
++	uint8_t out[2] = { 0, 0 };
++	uint8_t c[3];
++	uint16_t s = i2c5_xfer(MT6360_ADDR, f, 1, out, 2);
++	if ((s & 7u) != 1u)
++		return -1;
++	c[0] = (uint8_t)((MT6360_ADDR << 1) | 1);
++	c[1] = f[0];
++	c[2] = out[0];
++	if (crc8_07(c, 3) != out[1])
++		return -1;
++	return out[0];
++}
++
++static int
++i2c5_bringup(void)
++{
++	gwr32(g_impiic, 0xe04, TOR_IMPIIC_CG);       /* CG clr */
++	gpio_mode(PIN_I2C5_SCL, PIN_I2C5_FUNC);
++	gpio_mode(PIN_I2C5_SDA, PIN_I2C5_FUNC);
++	i2cw(I2C_START, 0);
++	gwr32(g_i2c_dma, 0x0c, 0x0002);              /* DMA hard reset */
++	delay(50);
++	gwr32(g_i2c_dma, 0x0c, 0);
++	delay(50);
++	i2cw(I2C_SOFTRST, 1);
++	delay(50);
++	i2cw(I2C_DCM_EN, 0);
++	i2cw(I2C_IOCFG, 0);
++	i2cw(I2C_HS, 0);
++	i2cw(I2C_EXT_CONF, 0x1800);
++	i2cw(I2C_TIMING, 0x073f);                    /* ~150 kHz */
++	int en = mt6360_rd(MT6360_FLED_EN);
++	printf("SWEET TORCH: fled_en=%#x stat=%#x\n", en,
++	    mt6360_rd(MT6360_FLED_STAT1));
++	return en >= 0 ? 0 : -1;
++}
++
++int
++sweet_torch_set(int level)
++{
++	int en;
++	if (!g_ready)
++		return -1;
++	if (level <= 0) {
++		en = mt6360_rd(MT6360_FLED_EN);
++		if (en < 0 || mt6360_wr(MT6360_FLED_EN,
++		    (uint8_t)(en & ~FLED_ON)))
++			return -1;
++		g_level = 0;
++		printf("SWEET TORCH: off\n");
++		return 0;
++	}
++	if (level > (int)FLED_MASK)
++		level = (int)FLED_MASK;
++	if (mt6360_wr(MT6360_FLED1_TOR, (uint8_t)level) ||
++	    mt6360_wr(MT6360_FLED2_TOR, (uint8_t)level))
++		return -1;
++	en = mt6360_rd(MT6360_FLED_EN);
++	if (en < 0 || mt6360_wr(MT6360_FLED_EN, (uint8_t)(en | FLED_ON)))
++		return -1;
++	g_level = level;
++	printf("SWEET TORCH: level %d (fled_en=%#x)\n", level,
++	    mt6360_rd(MT6360_FLED_EN));
++	return 0;
++}
++
++/* sysctl kern.sweettorch: read current level, write 0..31 */
++static int
++sysctl_torch(SYSCTL_HANDLER_ARGS)
++{
++	int val = g_level, error;
++	(void)oidp; (void)arg1; (void)arg2;
++	error = sysctl_handle_int(oidp, &val, 0, req);
++	if (error || !req->newptr)
++		return error;
++	return sweet_torch_set(val) ? EPERM : 0;
++}
++SYSCTL_PROC(_kern, OID_AUTO, sweettorch,
++    CTLFLAG_RW | CTLFLAG_LOCKED | CTLFLAG_ANYBODY | CTLTYPE_INT,
++    0, 0, sysctl_torch, "I", "torch level 0..31");
++
++static int
++torch_write(dev_t dev, struct uio *uio, int ioflag)
++{
++	char buf[16];
++	int len;
++	(void)dev; (void)ioflag;
++	len = MIN(uio_resid(uio), (int)sizeof(buf) - 1);
++	if (len <= 0)
++		return 0;
++	if (uiomove(buf, len, uio))
++		return EFAULT;
++	buf[len] = 0;
++	return sweet_torch_set((int)simple_strtol(buf, NULL, 10)) ? EIO : 0;
++}
++
++static const struct cdevsw torch_cdevsw = {
++	.d_open = eno_open,
++	.d_close = eno_close,
++	.d_write = torch_write,
++	.d_ioctl = eno_ioctl,
++	.d_stop = eno_stop,
++	.d_reset = eno_reset,
++	.d_select = eno_select,
++	.d_mmap = eno_mmap,
++	.d_strategy = eno_strat,
++	.d_type = D_DISK,
++};
++
++void
++sweet_torch_init(void)
++{
++	int enabled = 1;
++	if (g_started)
++		return;
++	g_started = 1;
++	(void)PE_parse_boot_argn("sweettorch", &enabled, sizeof(enabled));
++	if (!enabled)
++		return;
++	g_i2c = ml_io_map(TOR_I2C5_PA, 0x1000);
++	g_i2c_dma = ml_io_map(TOR_I2C5_DMA_PA, 0x1000);
++	g_impiic = ml_io_map(TOR_IMPIIC_PA, 0x1000);
++	g_gpio = ml_io_map(TOR_GPIO_PA, 0x1000);
++	if (!g_i2c || !g_i2c_dma || !g_impiic || !g_gpio) {
++		printf("SWEET TORCH: map failed\n");
++		return;
++	}
++	g_ready = !i2c5_bringup();
++	if (!g_ready)
++		return;
++	int maj = cdevsw_add(-1, &torch_cdevsw);
++	if (maj >= 0)
++		g_node = devfs_make_node(makedev(maj, 0), DEVFS_CHAR,
++		    UID_ROOT, GID_OPERATOR, 0660, "sweettorch");
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */

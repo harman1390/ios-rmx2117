@@ -1,0 +1,321 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -56,6 +56,7 @@
+ extern void sweet_usb_probe(void);
+ extern void sweet_gpu_init(void);
+ extern void sweet_conn_init(void);
++extern void sweet_batt_init(void);
+ 
+ #define REG_CAP         0x00
+ #define REG_IS          0x20
+@@ -685,6 +686,11 @@
+ 	sweet_keys_init();
+ 	sweet_touch_init();
+ 	sweet_usb_probe();
++	sweet_gpu_init();
++	sweet_conn_init();
++	/* Peripheral drivers: battery service, torch, camera probe, mic
++	 * probe (each boot-arg gated; see SWEET *: log lines). */
++	sweet_batt_init();
+ 	return 0;
+ }
+ 
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -114,6 +114,7 @@
+ bsd/dev/sweet_nvt_fw.c			standard
+ bsd/dev/sweet_gpu.c			standard
+ bsd/dev/sweet_conn.c			standard
++bsd/dev/sweet_batt.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- /dev/null
++++ b/bsd/dev/sweet_batt.c
+@@ -0,0 +1,286 @@
++/*
++ * SWEET battery service for MediaTek MT6853 (RMX2117 / Narzo 30 Pro 5G).
++ *
++ * Reads the MT6359P PMIC fuel-gauge ADC over pwrap SWINF_2 (the same
++ * channel keys.c and sweet_gpu.c use, serialised by sweet_pwrap_lock):
++ *
++ *   AUXADC channels (vendor drivers/iio/adc/mt635x-auxadc.c,
++ *   mt6359_auxadc_regs_tbl):
++ *     BATADC  ch0  -> request bit AUXADC_RQST0 b0, result AUXADC_ADC0
++ *     VCDT    ch2  -> request bit AUXADC_RQST0 b2, result AUXADC_ADC2
++ *     BAT_TEMP ch3 -> request bit AUXADC_RQST0 b3, result AUXADC_ADC3
++ *   Request: set the channel bit in AUXADC_RQST0, poll the channel's
++ *   OUT register until bit15 (RDY), value = OUT & 0x7fff.
++ *   Vendor scale: mv = raw * VOLT_FULL(1800mV) * r_ratio / (2^res).
++ *   BATADC res=15, r_ratio=3.5 (BATSNS divider, R_VAL_TEMP_3=35 in
++ *   mt6359_gauge.c): mv = raw * 1800 * 35 / 32768 / 10 = raw*6300/32768.
++ *
++ *   Charger present: CHR_CON0 (0xa88) bit0 RGS_CHRDET (vendor
++ *   PMIC_RGS_CHRDET_ADDR).
++ *
++ * The percent value here is a voltage estimate (linear 3.40..4.35 V):
++ * the real SOC lives in the MTK battery_meter middleware (fuel gauge
++ * NAG/CAR algorithm), which is a documented follow-on.  Values refresh
++ * every 10 s on a kernel thread and are published via sysctl
++ * hw.sweetbatt.* and a /dev/sweetbatt read node.
++ *
++ * Boot-arg: sweetbatt=1 (default on once verified; set sweetbatt=0 to
++ * disable).  No PMIC writes happen except the AUXADC request bits and
++ * the one-time AUXADC unlock/reset sequence below.
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/conf.h>
++#include <sys/uio.h>
++#include <sys/proc.h>
++#include <sys/sysctl.h>
++#include <miscfs/devfs/devfs.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern void sweet_pwrap_lock(void);
++extern void sweet_pwrap_unlock(void);
++void sweet_batt_init(void);
++
++/* pwrap SWINF_2 (same regs as sweet_keys.c / sweet_gpu.c) */
++#define PWRAP_PA     0x10026000u
++#define PWRAP_ACC    0x0c80u
++#define PWRAP_WDATA  0x0c84u
++#define PWRAP_RDATA  0x0c94u
++#define PWRAP_VLDCLR 0x0ca4u
++#define PWRAP_STA    0x0ca8u
++#define PWRAP_FSM(x) (((x) >> 1) & 7u)
++#define PWRAP_IDLE   0u
++#define PWRAP_WFVLD  6u
++
++/* MT6359P auxadc (vendor mt6359p/registers.h) */
++#define AUX_RQST0      0x1108u
++#define AUX_ADC0       0x1088u  /* BATADC */
++#define AUX_ADC3       0x108eu  /* BAT_TEMP */
++#define AUX_KEY        0x0fb4u  /* HK_TOP_WKEY: write 0x6359 to unlock */
++#define AUX_RSTCON0    0x0f90u  /* HK_TOP_RST_CON0: b0=RG_AUXADC_RST
++				 *                b3=BANK_AUXADC_SWRST */
++#define AUX_RDY        (1u << 15)
++#define AUX_OUT_MASK   0x7fffu
++
++#define CHR_CON0       0x0a88u  /* bit0 = RGS_CHRDET */
++
++static vm_offset_t g_pwrap;
++static int g_started, g_alive;
++static int g_mv, g_pct, g_chg, g_raw, g_battmp = -1;
++static int g_sleep_chan;
++static void *g_node;
++
++static uint32_t
++prd(uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(g_pwrap + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++pwr(uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(g_pwrap + off) = v;
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++static int
++pwait(uint32_t want)
++{
++	for (int i = 0; i < 1000; ++i) {
++		if (PWRAP_FSM(prd(PWRAP_STA)) == want)
++			return 0;
++		delay(1);
++	}
++	return -1;
++}
++
++static int
++pmic_r(uint32_t adr, uint32_t *out)
++{
++	if (pwait(PWRAP_IDLE)) {
++		if (PWRAP_FSM(prd(PWRAP_STA)) == PWRAP_WFVLD)
++			pwr(PWRAP_VLDCLR, 1);
++		return -1;
++	}
++	pwr(PWRAP_ACC, adr);
++	if (pwait(PWRAP_WFVLD))
++		return -2;
++	*out = prd(PWRAP_RDATA) & 0xffffu;
++	pwr(PWRAP_VLDCLR, 1);
++	return 0;
++}
++
++static int
++pmic_w(uint32_t adr, uint32_t v)
++{
++	if (pwait(PWRAP_IDLE))
++		return -1;
++	pwr(PWRAP_WDATA, v & 0xffffu);
++	pwr(PWRAP_ACC, (1u << 29) | adr);
++	return pwait(PWRAP_IDLE) ? -2 : 0;
++}
++
++/* request a conversion on auxadc channel ch (RQST0 bit index), poll RDY */
++static int
++aux_read(int rqst_bit, uint32_t out_reg, uint32_t *raw)
++{
++	uint32_t v;
++	if (pmic_r(AUX_RQST0, &v) || pmic_w(AUX_RQST0, v | (1u << rqst_bit)))
++		return -1;
++	for (int i = 0; i < 2000; ++i) {
++		if (pmic_r(out_reg, &v))
++			return -2;
++		if (v & AUX_RDY) {
++			*raw = v & AUX_OUT_MASK;
++			return 0;
++		}
++		delay(10);
++	}
++	return -3;
++}
++
++static void
++batt_refresh(void)
++{
++	uint32_t raw = 0, v = 0;
++	sweet_pwrap_lock();
++	if (aux_read(0, AUX_ADC0, &raw) == 0) {          /* BATADC, res 15 */
++		g_raw = (int)raw;
++		g_mv = (int)((raw * 6300u) >> 15);          /* *1800*3.5/32768 */
++		/* linear estimate over a typical 3.40-4.35 V Li-ion span */
++		g_pct = (g_mv - 3400) * 100 / 950;
++		if (g_pct < 0)
++			g_pct = 0;
++		if (g_pct > 100)
++			g_pct = 100;
++	}
++	if (aux_read(3, AUX_ADC3, &v) == 0)               /* BAT_TEMP, res 12 */
++		g_battmp = (int)(v & 0xfffu);
++	if (pmic_r(CHR_CON0, &v) == 0)
++		g_chg = (v & 1u) ? 1 : 0;
++	sweet_pwrap_unlock();
++	g_alive = 1;
++}
++
++static void
++batt_sleep_ms(int ms)
++{
++	uint64_t deadline;
++	clock_interval_to_deadline(ms, NSEC_PER_MSEC, &deadline);
++	(void)assert_wait_deadline(&g_sleep_chan, THREAD_UNINT, deadline);
++	thread_block(THREAD_CONTINUE_NULL);
++}
++
++static void
++batt_thread(void *arg, wait_result_t result)
++{
++	(void)arg;
++	(void)result;
++	/* one-time AUXADC unlock + reset pulse (vendor pmic_auxadc.c) */
++	sweet_pwrap_lock();
++	uint32_t v;
++	if (pmic_w(AUX_KEY, 0x6359) == 0) {
++		if (pmic_r(AUX_RSTCON0, &v) == 0) {        /* RG_AUXADC_RST b0 */
++			pmic_w(AUX_RSTCON0, v | 1);
++			pmic_w(AUX_RSTCON0, v & ~1u);
++		}
++		if (pmic_r(AUX_RSTCON0, &v) == 0) {        /* BANK_SWRST b3 */
++			pmic_w(AUX_RSTCON0, v | 8);
++			pmic_w(AUX_RSTCON0, v & ~8u);
++		}
++		pmic_w(AUX_KEY, 0);
++	}
++	sweet_pwrap_unlock();
++	printf("SWEET BATT: auxadc unlocked, sampling\n");
++	for (;;) {
++		batt_refresh();
++		if (g_mv)
++			printf("SWEET BATT: %d mV raw=%#x pct=%d%% chr=%d tmp=%#x\n",
++			    g_mv, g_raw, g_pct, g_chg, g_battmp);
++		batt_sleep_ms(10000);
++	}
++}
++
++/* ---- sysctl hw.sweetbatt.* ----------------------------------------- */
++
++SYSCTL_DECL(_hw_sweetbatt);
++SYSCTL_NODE(_hw, OID_AUTO, sweetbatt, CTLFLAG_RW | CTLFLAG_LOCKED, 0,
++    "RMX2117 battery");
++SYSCTL_INT(_hw_sweetbatt, OID_AUTO, mvolt, CTLFLAG_RD, &g_mv, 0,
++    "battery voltage (mV)");
++SYSCTL_INT(_hw_sweetbatt, OID_AUTO, percent, CTLFLAG_RD, &g_pct, 0,
++    "estimated battery percent");
++SYSCTL_INT(_hw_sweetbatt, OID_AUTO, charging, CTLFLAG_RD, &g_chg, 0,
++    "charger present");
++SYSCTL_INT(_hw_sweetbatt, OID_AUTO, raw, CTLFLAG_RD, &g_raw, 0,
++    "raw BATADC count");
++
++/* ---- /dev/sweetbatt ------------------------------------------------- */
++
++static int
++batt_open(dev_t dev, int flags, int devtype, proc_t p)
++{
++	(void)dev; (void)flags; (void)devtype; (void)p;
++	return g_alive ? 0 : EAGAIN;
++}
++
++static int
++batt_read(dev_t dev, struct uio *uio, int ioflag)
++{
++	char buf[96];
++	(void)dev; (void)ioflag;
++	int len = snprintf(buf, sizeof(buf), "%d %d %d %d %d\n",
++	    g_mv, g_pct, g_chg, g_raw, g_battmp);
++	return uiomove(buf, len, uio);
++}
++
++static const struct cdevsw batt_cdevsw = {
++	.d_open = batt_open,
++	.d_close = eno_close,
++	.d_read = batt_read,
++	.d_ioctl = eno_ioctl,
++	.d_stop = eno_stop,
++	.d_reset = eno_reset,
++	.d_select = eno_select,
++	.d_mmap = eno_mmap,
++	.d_strategy = eno_strat,
++	.d_type = D_DISK,
++};
++
++void
++sweet_batt_init(void)
++{
++	int enabled = 1;
++	thread_t thread;
++	if (g_started)
++		return;
++	g_started = 1;
++	(void)PE_parse_boot_argn("sweetbatt", &enabled, sizeof(enabled));
++	if (!enabled) {
++		printf("SWEET BATT: off (sweetbatt=0 used)\n");
++		return;
++	}
++	g_pwrap = ml_io_map(PWRAP_PA, 0x1000);
++	if (!g_pwrap) {
++		printf("SWEET BATT: pwrap map failed\n");
++		return;
++	}
++	int maj = cdevsw_add(-1, &batt_cdevsw);
++	if (maj >= 0)
++		g_node = devfs_make_node(makedev(maj, 0), DEVFS_CHAR,
++		    UID_ROOT, GID_OPERATOR, 0444, "sweetbatt");
++	kern_return_t kr = kernel_thread_start(batt_thread, NULL, &thread);
++	if (kr == KERN_SUCCESS)
++		thread_deallocate(thread);
++	else
++		printf("SWEET BATT: thread failed %d\n", kr);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
