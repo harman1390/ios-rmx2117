@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/bsd/dev/sweet_cam.c
-@@ -0,0 +1,350 @@
+@@ -0,0 +1,352 @@
 +/*
 + * SWEET camera probe for RMX2117 (MT6853) -- probe level only.
 + *
@@ -291,12 +291,14 @@
 +	static const uint8_t addrs[] = { 0x10, 0x20, 0x5a, 0x6c, 0x34 };
 +	uint8_t hi = 0, lo = 0, found = 0;
 +	for (unsigned i = 0; i < sizeof(addrs); ++i) {
-+		if (cam_rd16(addrs[i], 0x0000, &hi) == 0 &&
-+		    cam_rd16(addrs[i], 0x0001, &lo) == 0) {
-+			printf("SWEET CAM: sensor @0x%02x id=%02x%02x\n",
-+			    addrs[i], hi, lo);
++		uint16_t s0 = i2c2_xfer(addrs[i],
++		    (uint8_t[]){ 0x00, 0x00 }, 2, &hi, 1);
++		uint16_t s1 = i2c2_xfer(addrs[i],
++		    (uint8_t[]){ 0x00, 0x01 }, 2, &lo, 1);
++		printf("SWEET CAM: @0x%02x s0=%#x s1=%#x id=%02x%02x\n",
++		    addrs[i], s0, s1, hi, lo);
++		if ((s0 & 7u) == 1u && (s1 & 7u) == 1u)
 +			found = 1;
-+		}
 +	}
 +	if (!found)
 +		printf("SWEET CAM: no sensor ACK on i2c2 "

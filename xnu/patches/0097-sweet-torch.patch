@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/bsd/dev/sweet_torch.c
-@@ -0,0 +1,317 @@
+@@ -0,0 +1,325 @@
 +/*
 + * SWEET torch/flashlight driver for RMX2117 (MT6853).
 + *
@@ -309,7 +309,15 @@
 +		printf("SWEET TORCH: map failed\n");
 +		return;
 +	}
-+	g_ready = !i2c5_bringup();
++	/* touch already brings up i2c5; a full re-init (DMA hard
++	 * reset + SOFTRST) wedges the bus. Probe the LDO2_EN rail
++	 * (0x11) touch configures -- live means we reuse the bus. */
++	if (mt6360_rd(0x11) >= 0) {
++		g_ready = 1;
++		printf("SWEET TORCH: i2c5 reused (bus already up)\n");
++	} else {
++		g_ready = !i2c5_bringup();
++	}
 +	if (!g_ready)
 +		return;
 +	int maj = cdevsw_add(-1, &torch_cdevsw);
