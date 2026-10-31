@@ -19,6 +19,11 @@ screen (image versions v8-v14 in NOTES.md):
   audio           VirtualAudio HAL plug-in disabled (mediaserverd crash)
   MediaToolbox    StartRecorderServer=false (camera filter prewarm calls a
                   NULL OpenGL function without a GPU -> mediaserverd crash loop)
+  PosterBoard     launchd job Disabled=true: it trap-loops every boot (sig 5,
+                  shared-cache assert, still root-causing) and the respawn
+                  burns CPU + floods sweetlog with crash spam. Disabled until
+                  the assert is fixed; wallpaper is PosterBoard's job so it
+                  stays absent meanwhile (not a missing-asset issue).
   SpringBoard     BKNoWatchdogs (one slow CPU path, no scene-create watchdog
                   kills), no cloud-configuration UI
   Setup           skipped: SetupDone, SetupFinishedAllSteps, SetupVersion 11,
@@ -112,7 +117,12 @@ def audio(root):
     dst_dir = os.path.join(root, 'Library/Audio/Plug-Ins/HAL.disabled')
     if os.path.exists(src):
         os.makedirs(dst_dir, exist_ok=True)
-        shutil.move(src, dst_dir)
+        dst = os.path.join(dst_dir, 'VirtualAudio.plugin')
+        if os.path.exists(dst):
+            # Prior run copied it but could not remove the source on hfsplus.
+            shutil.rmtree(src)
+        else:
+            shutil.move(src, dst_dir)
         print('VirtualAudio.plugin disabled')
     for conf in glob.glob(os.path.join(root, 'System/Library/Frameworks/MediaToolbox.framework/*/SubServerConfiguration.plist')):
         st = os.stat(conf)
@@ -120,6 +130,22 @@ def audio(root):
         data['StartRecorderServer'] = False
         save(conf, data, st.st_uid, st.st_gid, st.st_mode & 0o7777, plistlib.FMT_XML)
         print('StartRecorderServer off', os.path.relpath(conf, root))
+
+
+def posterboard(root):
+    # iOS 15+ wallpaper compositor; traps on a shared-cache assert every boot.
+    conf = os.path.join(root, 'System/Library/LaunchDaemons/com.apple.PosterBoard.plist')
+    if not os.path.exists(conf):
+        print('warning: no PosterBoard job plist; skipped')
+        return
+    st = os.stat(conf)
+    data = load(conf)
+    if data.get('Disabled'):
+        print('PosterBoard already disabled')
+        return
+    data['Disabled'] = True
+    save(conf, data, st.st_uid, st.st_gid, st.st_mode & 0o7777, plistlib.FMT_XML)
+    print('PosterBoard disabled')
 
 
 def main():
@@ -130,6 +156,7 @@ def main():
     containers(root)
     activation(root)
     audio(root)
+    posterboard(root)
     merge_pref(root, 'com.apple.migration', {
         'LastSystemVersion': BUILD,
         'DMUserDataDisposition': {'SyntheticDidUpgrade': False, 'buildVersion': BUILD}})
