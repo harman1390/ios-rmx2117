@@ -292,7 +292,7 @@
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 --- /dev/null
 +++ b/bsd/dev/sweet_touch.c
-@@ -0,0 +1,1173 @@
+@@ -0,0 +1,1175 @@
 +/*
 + * SWEET MT6853 SPI4 / Novatek NT36672C (oplus tp_noflash) touch bring-up.
 + * RMX2117 wiring from the stock DTBO: spi4@11018000, irq GPIO14, reset
@@ -1044,6 +1044,8 @@
 +		}
 +		twait(10);
 +	}
++	printf("SWEET TOUCH: nvt state=%02x %02x %02x %02x %02x (want>=%02x)\n",
++	    b[1], b[2], b[3], b[4], b[5], want);
 +	return false;
 +}
 +
@@ -1101,7 +1103,7 @@
 +		if (!nvt_write((uint8_t)(sram & 0x7f), fw + bin, len)) {
 +			return false;
 +		}
-+		if (!verified && len >= 64) {
++		if (verified < 3 && len >= 64) {
 +			/* one-shot write-back check: did all packets land? */
 +			uint8_t rb[16];
 +			nvt_page(sram);
@@ -1110,7 +1112,7 @@
 +			    sram, rok, rb[0], rb[1], rb[2], rb[3],
 +			    rb[14], rb[15],
 +			    fw[bin], fw[bin + 1], fw[bin + 14], fw[bin + 15]);
-+			verified = 1;
++			verified++;
 +		}
 +		sram += NVT_XFER_LEN;
 +		bin += NVT_XFER_LEN;
