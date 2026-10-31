@@ -292,16 +292,23 @@
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 --- /dev/null
 +++ b/bsd/dev/sweet_touch.c
-@@ -0,0 +1,980 @@
+@@ -0,0 +1,1009 @@
 +/*
 + * SWEET MT6853 SPI4 / Novatek NT36672C (oplus tp_noflash) touch bring-up.
 + * RMX2117 wiring from the stock DTBO: spi4@11018000, irq GPIO14, reset
 + * GPIO33, SPI pins GPIO12=MI, GPIO13=MO, GPIO97=CLK, GPIO98=CSB (func2).
-+ * CS uses SPI4's native CSB (pad-select 0), matching the stock Linux driver.
-+ * GPIO98 bit-banging remains a fallback if native-CS detection fails.
++ * CS is bit-banged on GPIO98: the engine deasserts CSB at every ACT
++ * boundary, so hardware CS would split each >32-byte NVT message
++ * (256-byte fw page writes, 80-byte point reads) into separate CS
++ * windows.  Manual CS keeps one window across all FIFO chunks.
 + * NT36672C is a "noflash" TDDI: SRAM firmware must be host-downloaded on
 + * every boot, mirroring Download_Firmware_HW_CRC() in the OPLUS
 + * nvt_drivers_nt36672c_noflash.c vendor driver (FW_NF_NT36672C_JDI.img).
++ * Wire format (vendor touch_interfaces.c): write = offset|0x80 then data;
++ * read  = offset&0x7f then one dummy MISO byte then data.  An earlier
++ * version sent writes without the 0x80 flag (silently dropped) and
++ * skipped the read dummy byte (all reads shifted one byte), which is why
++ * the chip-id probe could never match.
 + */
 +#if defined(ARM64_BOARD_CONFIG_SWEET)
 +#include <sys/param.h>
@@ -374,12 +381,20 @@
 +#define TP_PIN_SDA      108u        /* SDA5 */
 +#define TP_I2C_FUNC     1u
 +
-+/* --- MT6360 sub-PMIC on i2c5: "vtouch"/VTP LDO2 feeds the NT36672C ---- */
++/* --- MT6360 sub-PMIC on i2c5 -------------------------------------------
++ * mt_pmic_vtp_ldo_reg is LDO2 ("VTP") of the sub-PMIC.  NOTE: the project
++ * 20611 touchscreen node wires NO supply -- the incell TDDI is powered
++ * through the panel bias, which LK already turned on.  vdd_2v8->VTP is
++ * only declared on other projects (20630/20637).  This block is therefore
++ * OPT-IN (sweetvtp=1): without it we never touch i2c5, avoiding both a
++ * wrong rail and MMIO to a possibly clock-gated controller. */
 +#define TP_I2C5_PA      0x11d00000u /* i2c5 controller */
 +#define TP_I2C5_DMA_PA  0x10217500u /* DMA/reset resource from live i2c5 DT */
-+#define MT6360_ADDR     0x64u       /* subpmic_ldo, i2c-5 slave 0x64 */
++#define TP_IMPIIC_PA    0x11d04000u /* imp_iic_wrap_s clk gate: sta e00/clr e04 */
++#define TP_IMPIIC_I2C5  (1u << 0)   /* CLK_IMPS_AP_CLOCK_RO_I2C5 */
++#define MT6360_ADDR     0x64u       /* subpmic_ldo, i2c-5 slave 0x64 (unverified) */
 +#define MT6360_LDO2_EN  0x11u       /* EN_CTRL2: bit6 enables LDO2 */
-+#define MT6360_LDO2_VSEL 0x15u      /* CTRL3: 0x3d = 1.8 V (flat range) */
++#define MT6360_LDO2_VSEL 0x15u      /* CTRL3: 0xba = 3.1 V (flat range) */
 +
 +/* topckgen spi_sel mux (clk-mt6853): CLK_CFG_6 bits[17:16], upd bit26 */
 +#define TP_TOPCK_PA     0x10000000u
@@ -422,8 +437,8 @@
 +extern const unsigned int sweet_nvt_fw_size;
 +
 +static struct {
-+	vm_offset_t spi, gpio, infra, lm, bm, tl, i2c, i2c_dma, topck;
-+	bool started, dead, have_nvt, hw_cs;
++	vm_offset_t spi, gpio, infra, lm, bm, tl, i2c, i2c_dma, topck, impiic;
++	bool started, dead, have_nvt;
 +	uint32_t active;
 +	int x[TP_TOUCH_MAX], y[TP_TOUCH_MAX];
 +} st;
@@ -590,11 +605,15 @@
 +	return out[0];
 +}
 +
-+/* LDO2 is marked always-on/default-on in the stock DT; verify it and only
-+ * change it when I2C reads succeed, preserving the other regulator bits. */
++/* Opt-in VTP LDO2 bring-up (sweetvtp=1).  Project 20611 wires no TP
++ * supply, so the rail is probably unused here; keep it available for
++ * experiments.  Ungate the imp i2c5 bus clock before any MMIO. */
 +static void
 +vtp_power_on(void)
 +{
++	twr(st.impiic, 0xe04, TP_IMPIIC_I2C5); /* CG clr */
++	printf("SWEET TOUCH: i2c5 imp cg sta=%#x\n",
++	    trd(st.impiic, 0xe00));
 +	gpio_mode(TP_PIN_SCL, TP_I2C_FUNC);
 +	gpio_mode(TP_PIN_SDA, TP_I2C_FUNC);
 +	i2cw(I2C_REG_START, 0x0000); /* clear the I2C channel before reset */
@@ -617,7 +636,7 @@
 +		printf("SWEET TOUCH: cannot read vtp LDO2 state; leaving PMIC unchanged\n");
 +		return;
 +	}
-+	if ((vs & 0x3f) != 0x3d && mt6360_wr(MT6360_LDO2_VSEL, 0x3du) != 0) {
++	if ((vs & 0x3f) != 0xba && mt6360_wr(MT6360_LDO2_VSEL, 0xbau) != 0) {
 +		printf("SWEET TOUCH: vtp LDO2 voltage write failed\n");
 +		return;
 +	}
@@ -629,7 +648,7 @@
 +	en = mt6360_rd(MT6360_LDO2_EN);
 +	vs = mt6360_rd(MT6360_LDO2_VSEL);
 +	printf("SWEET TOUCH: vtp ldo2 after en=%#x vsel=%#x\n", en, vs);
-+	if (en < 0 || vs < 0 || !(en & 0x40) || (vs & 0x3f) != 0x3d)
++	if (en < 0 || vs < 0 || !(en & 0x40) || (vs & 0x3f) != 0xba)
 +		printf("SWEET TOUCH: vtp LDO2 state did not verify\n");
 +}
 +
@@ -680,13 +699,12 @@
 +	return true;
 +}
 +
-+/* CS control: manual GPIO98, or hardware CSB when st.hw_cs */
++/* CS control: bit-banged GPIO98 for the whole message; PAUSE_EN mirrors
++ * the vendor set_cs() (set = CS released / idle). */
 +static void
 +tp_cs(bool low)
 +{
-+	if (!st.hw_cs) {
-+		gpio_out(TP_PIN_CSB, !low);
-+	}
++	gpio_out(TP_PIN_CSB, !low);
 +	if (low) {
 +		twr(st.spi, SPI_CMD, trd(st.spi, SPI_CMD) & ~SPI_PAUSE_EN);
 +	} else {
@@ -792,7 +810,7 @@
 +	tp_cs(false);
 +}
 +
-+/* write data[] to (page-set) offset; buf[0]=offset&0x7f */
++/* write data[] to (page-set) offset; buf[0]=offset|0x80 (SPI_WRITE_MASK) */
 +static bool
 +nvt_write(uint8_t off, const uint8_t *data, unsigned n)
 +{
@@ -800,7 +818,7 @@
 +	if (n > NVT_XFER_LEN) {
 +		return false;
 +	}
-+	b[0] = off & 0x7f;
++	b[0] = off | 0x80u;
 +	for (unsigned i = 0; i < n; ++i) {
 +		b[1 + i] = data[i];
 +	}
@@ -819,26 +837,28 @@
 +
 +/*
 + * read n-1 bytes at offset into buf[1..n-1] (vendor CTP_SPI_READ
-+ * convention: buf[0]=offset is transmitted, MISO lands one byte later).
++ * convention).  The wire transfer is n+1 bytes: the offset byte, then the
++ * chip drives one dummy byte on MISO, then the data.  buf[0] keeps the
++ * transmitted offset like the vendor helper.
 + */
 +static bool
 +nvt_read(uint8_t off, uint8_t *buf, unsigned n)
 +{
-+	uint8_t tx[96], rx[96];
-+	if (n > sizeof(tx)) {
++	uint8_t tx[100], rx[100];
++	if (n + 1 > sizeof(tx)) {
 +		return false;
 +	}
 +	tx[0] = off & 0x7f;
-+	for (unsigned i = 1; i < n; ++i) {
++	for (unsigned i = 1; i <= n; ++i) {
 +		tx[i] = 0;
 +	}
 +	tp_cs(true);
-+	bool ok = spi_xfer(tx, rx, n);
++	bool ok = spi_xfer(tx, rx, n + 1);
 +	tp_cs(false);
 +	if (ok) {
 +		buf[0] = tx[0];
 +		for (unsigned i = 1; i < n; ++i) {
-+			buf[i] = rx[i];
++			buf[i] = rx[i + 1];
 +		}
 +	}
 +	return ok;
@@ -1168,19 +1188,21 @@
 +	st.tl = ml_io_map(TP_IOC_TL, 0x1000);
 +	st.i2c = ml_io_map(TP_I2C5_PA, 0x1000);
 +	st.i2c_dma = ml_io_map(TP_I2C5_DMA_PA, 0x80);
++	st.impiic = ml_io_map(TP_IMPIIC_PA, 0x1000);
 +	st.topck = ml_io_map(TP_TOPCK_PA, 0x1000);
 +	if (!st.spi || !st.gpio || !st.infra || !st.lm || !st.bm || !st.tl ||
-+	    !st.i2c || !st.i2c_dma || !st.topck) {
++	    !st.i2c || !st.i2c_dma || !st.impiic || !st.topck) {
 +		printf("SWEET TOUCH: MMIO mapping failed\n");
 +		goto out;
 +	}
 +
-+	/* pinmux: SPI4 pins f2; prefer the native CSB used by the stock driver */
++	/* pinmux: SPI4 pins f2; CSB stays a GPIO we bit-bang ourselves */
 +	gpio_mode(TP_PIN_MI, 2);
 +	gpio_mode(TP_PIN_MO, 2);
 +	gpio_mode(TP_PIN_CLK, 2);
-+	st.hw_cs = true;
-+	gpio_mode(TP_PIN_CSB, 2);
++	gpio_mode(TP_PIN_CSB, 0);
++	gpio_dir(TP_PIN_CSB, true);
++	gpio_out(TP_PIN_CSB, true);
 +	gpio_mode(TP_PIN_IRQ, 0);
 +	gpio_dir(TP_PIN_IRQ, false);
 +	/* iocfg: input-enable on MI/IRQ, pull-up on IRQ (matches int_active) */
@@ -1188,8 +1210,22 @@
 +	twr(st.tl, 0x0040, trd(st.tl, 0x0040) | (1u << 2));  /* GPIO14 IES */
 +	twr(st.tl, 0x0070, trd(st.tl, 0x0070) | (1u << 2));  /* GPIO14 PU */
 +
-+	/* "vtouch" LDO feeds the TDDI VCI; it is off until consumers ask */
-+	vtp_power_on();
++	/* Stock pinctrl holds GPIO43 output-high in the active state (TP
++	 * enable/reset companion line); mirror it so the rail stays up. */
++	gpio_mode(TP_PIN_RST2, 0);
++	gpio_dir(TP_PIN_RST2, true);
++	gpio_out(TP_PIN_RST2, true);
++
++	/* optional VTP LDO2 on i2c5 (sweetvtp=1); off by default since the
++	 * 20611 touch node declares no supply -- the TDDI is powered via the
++	 * panel, which is already on. */
++	int sweetvtp = 0;
++	(void)PE_parse_boot_argn("sweetvtp", &sweetvtp, sizeof(sweetvtp));
++	if (sweetvtp) {
++		vtp_power_on();
++	} else {
++		printf("SWEET TOUCH: vtp ldo2 skipped (sweetvtp=0; 20611 wires no tp supply)\n");
++	}
 +
 +	if (!spi_config()) {
 +		goto out;
@@ -1198,24 +1234,17 @@
 +	    gpio_in(TP_PIN_IRQ), gpio_in(33), gpio_in(43),
 +	    gpio_in(TP_PIN_CSB), gpio_in(TP_PIN_MI));
 +
-+	/* Project 20611 uses GPIO33; retain GPIO43 as an alternate-overlay fallback. */
++	/* Project 20611 uses GPIO33; retain GPIO43 pulse as an alternate. */
 +	bool detected = nvt_reset_and_detect(TP_PIN_RST, id);
 +	if (!detected) {
 +		printf("SWEET TOUCH: retrying with reset GPIO43\n");
 +		detected = nvt_reset_and_detect(TP_PIN_RST2, id);
-+	}
-+	if (!detected) {
-+		/* Preserve the pre-existing GPIO-CS path as a hardware fallback. */
-+		printf("SWEET TOUCH: retrying with GPIO CSB\n");
-+		st.hw_cs = false;
-+		gpio_mode(TP_PIN_CSB, 0);
-+		gpio_dir(TP_PIN_CSB, true);
-+		gpio_out(TP_PIN_CSB, true);
-+		detected = nvt_reset_and_detect(TP_PIN_RST, id);
++		/* GPIO43 is a hold-high line in stock; restore it. */
++		gpio_out(TP_PIN_RST2, true);
 +	}
 +	if (!detected) {
 +		printf("SWEET TOUCH: no NT36672C id (%02x %02x %02x %02x %02x %02x); "
-+		    "panel may be Himax HX83112F -- not supported yet\n",
++		    "panel may be Himax HX83112F or Ilitek ILI7807S -- not supported yet\n",
 +		    id[0], id[1], id[2], id[3], id[4], id[5]);
 +		goto out;
 +	}

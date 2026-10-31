@@ -26,7 +26,10 @@ were corrected by the live DTB.
 - CPUs: contiguous MPIDRs `core<<8` (6×A55 + 2×A76, NOT the MT6785
   non-contiguous layout — the `cpu@100` node names misled)
 - Panel NT35595 1080×2400; framebuffer `0x7e605000` (k6853v1_64 atag)
-- Touch: `goodix,touch`; bootargs `console=ttyS0,921600n1`
+- Touch: generic live-DTB node is `goodix,touch`, but the RMX2117 project
+  20611 overlay selects `oplus,tp_noflash` on SPI4 (IRQ GPIO14, reset GPIO33).
+  The overlay is more specific for touch bring-up; confirm the NT36672C
+  candidate driver with its chip-ID probe. Bootargs `console=ttyS0,921600n1`.
 
 ## Boot image (community-verified)
 
@@ -568,3 +571,44 @@ unplugged-kernel mt6853 sources, NOT guessed):**
 - The shipped image cmdline previously carried sweetkeys=0 sweettouch=0
   sweetusb=0 kill switches (mkpayload --cmdline); a new image must drop
   those for any of the input drivers to run.
+
+## 2026-10-31: Touch NVT protocol audit vs vendor source (bugs fixed)
+
+Checked the real oplus driver from the MT6853 kernel source
+(`drivers/input/touchscreen/oplus_touchscreen/Novatek/NT36672C_noflash/nvt_drivers_nt36672c_noflash.c`
++ `util_interface/touch_interfaces.[ch]`). Two protocol bugs in sweet_touch.c
+made every transfer wrong:
+
+- **`nvt_write` sent READ commands.** Vendor `CTP_SPI_WRITE` applies
+  `SPI_WRITE_MASK(buf[0]) = off|0x80`; we sent `off&0x7f`. Every write
+  (SWRST, ENG_RST, BOOT_RDY, CRC banks, all 256-byte fw pages) was
+  silently dropped -- fw download could never have worked.
+- **`nvt_read` missed the dummy byte.** Vendor clocks `len+1` bytes:
+  offset, then the chip emits ONE dummy MISO byte, then data
+  (`memcpy(buf+1, rbuf+2, len-1)`). We clocked `n` bytes and took
+  `rx[1]`, so all reads were shifted one byte and short by one --
+  chip-id never matched ("no NT36672C id" -> thread exits).
+- **hw_cs (a4fcd0c) can't frame >32B transfers.** The engine deasserts
+  CSB at every ACT boundary; 256B fw writes and 80B point reads split
+  into separate CS windows. Reverted to bit-banged GPIO98 for the whole
+  message (vendor packets would need packet_loop+PAUSE to use hw CSB).
+- **GPIO43 is a hold-high line**, not a spare reset: stock
+  `ctp_gt9896s_reset_active` pinctrl drives it output-high (output-low in
+  suspend). Now driven high at init; still pulsed as reset fallback.
+- **vtp_power_on() is wrong-project hardware.** The 20611 touch node
+  wires NO supply -- incell TDDI is powered via the panel bias LK left
+  on. `vdd_2v8->mt_pmic_vtp_ldo_reg` exists only on 20630/20637 nodes.
+  The i2c5 block also never ungated `imp_iic_wrap_s` CLK_IMPS_AP_CLOCK_RO_I2C5
+  (@0x11d04000 CG sta e00/clr e04 bit0) or the I2C_SEL mux -- MMIO to a
+  gated controller risks a hang/abort, and it programmed 1.8V where
+  vdd_2v8 defaults to 3.1V. Now gated behind `sweetvtp=1` (default off),
+  ungates imp clock first, writes 0xba (3.1V flat) instead of 0x3d.
+- MT6360 LDO regs themselves were right (EN_CTRL2 0x11 bit0x40,
+  CTRL3 0x15; from mt6360_ldo_regmap.c). MT6360 PMU i2c addr is 0x34;
+  the 0x64 subpmic_ldo addr is unverified.
+- dtb_6 of dtbo.img confirmed the node: `oplus,tp_noflash` on spi4,
+  irq GPIO14 falling, reset-gpio GPIO33 (pinctrl companion GPIO43),
+  spi-max-frequency 9.6MHz, mode0. Recovery maps project 20686 -> dir
+  20611. Panels offered: nt36672c (JDI/TM), hx83112f, ili7807s -- so if
+  chip-id still fails the unit may have the Himax/Ilitek TDDI, which
+  needs a different driver.
