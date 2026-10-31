@@ -292,7 +292,7 @@
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 --- /dev/null
 +++ b/bsd/dev/sweet_touch.c
-@@ -0,0 +1,1016 @@
+@@ -0,0 +1,1124 @@
 +/*
 + * SWEET MT6853 SPI4 / Novatek NT36672C (oplus tp_noflash) touch bring-up.
 + * RMX2117 wiring from the stock DTBO: spi4@11018000, irq GPIO14, reset
@@ -321,6 +321,8 @@
 +#include <pexpert/pexpert.h>
 +
 +extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern void *kernel_pmap;
++extern unsigned int pmap_find_phys(void *pmap, unsigned long long va);
 +/* Mach MIG declaration is not included by BSD's exported thread.h. */
 +extern kern_return_t thread_terminate(thread_t);
 +extern void sweet_hid_touch(int finger, int down, int x, int y);
@@ -362,6 +364,13 @@
 +#define SPI_ST0_PAUSE   2u
 +
 +#define SPI_FIFO        32u
++/* dma regs (spi-mt65xx.c SPI_TX_SRC_REG etc; mt6853 supports 36b dma) */
++#define SPI_TX_SRC        0x08u
++#define SPI_RX_DST        0x0cu
++#define SPI_TX_SRC_64     0x2cu
++#define SPI_RX_DST_64     0x30u
++#define SPI_CMD_RX_DMA    (1u << 10)
++#define SPI_CMD_TX_DMA    (1u << 11)
 +
 +/* GPIO block (all pins, ibase0) */
 +#define TP_DIR(pin)     (0x0000u + ((pin) / 32u) * 0x10u)
@@ -712,6 +721,97 @@
 +	}
 +}
 +
++/* DMA buffers: one cache-line-aligned bounce for each direction.  The
++ * mt65xx engine DMAs >32-byte transfers as a whole packet chain; FIFO
++ * mode stalls on the second packet (st0=0, vendor uses DMA there too). */
++static uint8_t sdma_tx[NVT_XFER_LEN + 32] __attribute__((aligned(64)));
++static uint8_t sdma_rx[128] __attribute__((aligned(64)));
++
++static void
++dcache_clean(const void *p, size_t n)
++{
++	uintptr_t a = (uintptr_t)p & ~63ull;
++	uintptr_t e = ((uintptr_t)p + n + 63) & ~63ull;
++	for (; a < e; a += 64) {
++		__asm__ volatile("dc cvau, %0" :: "r"(a) : "memory");
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++static void
++dcache_inval(const void *p, size_t n)
++{
++	uintptr_t a = (uintptr_t)p & ~63ull;
++	uintptr_t e = ((uintptr_t)p + n + 63) & ~63ull;
++	for (; a < e; a += 64) {
++		__asm__ volatile("dc civac, %0" :: "r"(a) : "memory");
++	}
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++static uint64_t
++kphys(const void *va)
++{
++	uint64_t a = (uint64_t)(uintptr_t)va;
++	return ((uint64_t)pmap_find_phys(kernel_pmap, a) << 12) | (a & 0xffful);
++}
++
++/* One DMA shot for a 32-byte-multiple span inside the caller's CS window. */
++static bool
++spi_dma(const uint8_t *tx, uint8_t *rx, unsigned len)
++{
++	uint32_t cmd = trd(st.spi, SPI_CMD);
++	uint32_t c1 = trd(st.spi, SPI_CFG1);
++	c1 = (c1 & ~0x3ffff00u) | ((32u - 1u) << 16) |
++	    (((len / 32u) - 1u) << 8);
++	twr(st.spi, SPI_CFG1, c1);
++	if (tx) {
++		if (len > sizeof(sdma_tx)) {
++			return false;
++		}
++		for (unsigned i = 0; i < len; ++i) {
++			sdma_tx[i] = tx[i];
++		}
++		dcache_clean(sdma_tx, len);
++		uint64_t pa = kphys(sdma_tx);
++		twr(st.spi, SPI_TX_SRC, (uint32_t)pa);
++		twr(st.spi, SPI_TX_SRC_64, (uint32_t)(pa >> 32));
++		cmd |= SPI_CMD_TX_DMA;
++	} else {
++		cmd &= ~SPI_CMD_TX_DMA;
++	}
++	if (rx) {
++		if (len > sizeof(sdma_rx)) {
++			return false;
++		}
++		uint64_t pa = kphys(sdma_rx);
++		twr(st.spi, SPI_RX_DST, (uint32_t)pa);
++		twr(st.spi, SPI_RX_DST_64, (uint32_t)(pa >> 32));
++		cmd |= SPI_CMD_RX_DMA;
++	} else {
++		cmd &= ~SPI_CMD_RX_DMA;
++	}
++	twr(st.spi, SPI_ST0, trd(st.spi, SPI_ST0)); /* w1c */
++	twr(st.spi, SPI_CMD, (cmd & ~SPI_RESUME) | SPI_ACT);
++	if (!spi_done()) {
++		printf("SWEET TOUCH: spi dma timeout st0=%#x cmd=%#x len=%u
++",
++		    trd(st.spi, SPI_ST0), trd(st.spi, SPI_CMD), len);
++		twr(st.spi, SPI_CMD,
++		    trd(st.spi, SPI_CMD) & ~(SPI_CMD_TX_DMA | SPI_CMD_RX_DMA));
++		return false;
++	}
++	twr(st.spi, SPI_CMD,
++	    trd(st.spi, SPI_CMD) & ~(SPI_CMD_TX_DMA | SPI_CMD_RX_DMA));
++	if (rx) {
++		dcache_inval(sdma_rx, len);
++		for (unsigned i = 0; i < len; ++i) {
++			rx[i] = sdma_rx[i];
++		}
++	}
++	return true;
++}
++
 +static bool
 +spi_done(void)
 +{
@@ -738,15 +838,27 @@
 +spi_xfer(const uint8_t *tx, uint8_t *rx, unsigned len)
 +{
 +	unsigned off = 0;
++	/* vendor: >32-byte transfers run as one DMA packet chain; the FIFO
++	 * path is only for the <=31-byte tail. */
++	unsigned dma_len = len & ~31u;
++	if (dma_len) {
++		if (!spi_dma(tx, rx, dma_len)) {
++			return false;
++		}
++		off = dma_len;
++		if (tx) {
++			tx += dma_len;
++		}
++		if (rx) {
++			rx += dma_len;
++		}
++	}
 +	twr(st.spi, SPI_CMD, trd(st.spi, SPI_CMD) | SPI_RST);
 +	twr(st.spi, SPI_CMD, trd(st.spi, SPI_CMD) & ~SPI_RST);
 +	while (off < len) {
 +		unsigned n = len - off;
-+		/* RX FIFO is 32B and is only drained after a packet; cap each
-+		 * packet so full-duplex MISO can never fill it mid-transfer
-+		 * (st0=0 finish timeouts seen on 257-byte fw writes). */
-+		if (n > 24u) {
-+			n = 24u;
++		if (n > SPI_FIFO) {
++			n = SPI_FIFO;
 +		}
 +		/* packet = n bytes, single loop; keep cs_idle (bits0-7) */
 +		uint32_t c1 = trd(st.spi, SPI_CFG1);
@@ -770,11 +882,7 @@
 +			twr(st.spi, SPI_TXD, v);
 +		}
 +		twr(st.spi, SPI_ST0, trd(st.spi, SPI_ST0)); /* w1c */
-+		/* vendor mtk_spi_enable_transfer: the engine PAUSES after each
-+		 * packet; continuing the same transfer needs RESUME, a fresh
-+		 * ACT is ignored and the packet never completes (st0=0). */
-+		twr(st.spi, SPI_CMD, trd(st.spi, SPI_CMD) |
-+		    (off == 0 ? SPI_ACT : SPI_RESUME));
++		twr(st.spi, SPI_CMD, trd(st.spi, SPI_CMD) | SPI_ACT);
 +		if (!spi_done()) {
 +			printf("SWEET TOUCH: spi finish timeout st0=%#x cmd=%#x\n",
 +			    trd(st.spi, SPI_ST0), trd(st.spi, SPI_CMD));

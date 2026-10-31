@@ -21,7 +21,7 @@ index 0000000..0000000 100644
  	uint32_t      fDirect;        /* sweetfb_direct: DMA the surface, no copy */
  	uint32_t      fDirectMiss;    /* frames that fell back to the copy */
  	uint32_t      fStatDirect;    /* presents done by OVL scanout */
-@@ -234,16 +235,27 @@
+@@ -234,16 +235,40 @@
  	if (fOVL != NULL) {
  		uint32_t en = fOVL[SWEET_OVL_EN / 4];
  		uint32_t src_con = fOVL[SWEET_OVL_SRC_CON / 4];
@@ -35,15 +35,28 @@ index 0000000..0000000 100644
 -		    l_addr != (uint32_t)fPhys || fScanPitch != fRowBytes ||
 -		    (l_pitchmsb & 0xf) != ((fRowBytes >> 16) & 0xf)) {
 -			IOLog("SWEET FB: ovl0_2l L1 not scanning this fb; direct off\n");
++		volatile uint32_t *blocks[2] = {
++			fOVL, (volatile uint32_t *)ml_io_map(0x14005000, 0x1000)
++		};
 +		fScanLayer = 0xffffffffu;
-+		for (uint32_t l = 0; l < 4; l++) {
-+			uint32_t la = fOVL[SWEET_OVL_L_ADDR(l) / 4];
-+			uint32_t lp = fOVL[SWEET_OVL_L_PITCH(l) / 4];
-+			IOLog("SWEET FB: ovl0_2l en 0x%x src_con 0x%x L%u addr 0x%x pitch 0x%x\n",
-+			    en, src_con, l, la, lp);
-+			if ((src_con & (1u << l)) && la == (uint32_t)fPhys &&
-+			    (lp & 0xffff) == fRowBytes) {
-+				fScanLayer = l;
++		for (int b = 0; b < 2; b++) {
++			volatile uint32_t *o = blocks[b];
++			if (o == NULL) {
++				continue;
++			}
++			uint32_t ben = o[SWEET_OVL_EN / 4];
++			uint32_t bsc = o[SWEET_OVL_SRC_CON / 4];
++			for (uint32_t l = 0; l < 4; l++) {
++				uint32_t la = o[SWEET_OVL_L_ADDR(l) / 4];
++				uint32_t lp = o[SWEET_OVL_L_PITCH(l) / 4];
++				IOLog("SWEET FB: ovl%u en 0x%x src_con 0x%x L%u addr 0x%x pitch 0x%x\n",
++				    b, ben, bsc, l, la, lp);
++				if ((bsc & (1u << l)) && la == (uint32_t)fPhys &&
++				    (lp & 0xffff) == fRowBytes &&
++				    fScanLayer == 0xffffffffu) {
++					fScanLayer = l;
++					fOVL = o;
++				}
 +			}
 +		}
 +		volatile uint32_t *rdma =
@@ -59,7 +72,7 @@ index 0000000..0000000 100644
  			fDirect = 0;
  		}
  	} else {
-@@ -309,10 +321,10 @@
+@@ -309,10 +334,10 @@
  			 * a CA surface, point it back here first. Keep the
  			 * previous buffer alive one more frame like present(). */
  			if (fb->fOVL != NULL && fb->fScan[0] != NULL) {
@@ -73,7 +86,7 @@ index 0000000..0000000 100644
  					fb->fScanPitch = fb->fRowBytes;
  				}
  				OSSynchronizeIO();
-@@ -504,10 +516,10 @@
+@@ -504,10 +529,10 @@
  			}
  		}
  		if (addr != 0) {
@@ -87,7 +100,7 @@ index 0000000..0000000 100644
  				fScanPitch = pitch;
  			}
  			OSSynchronizeIO();
-@@ -538,10 +550,10 @@
+@@ -538,10 +563,10 @@
  	 * fPhys: it may still be scanning the previous direct surface, and
  	 * the pixels memcpy'd below land in fPhys, not there. */
  	if (fOVL != NULL && fScan[0] != NULL) {
