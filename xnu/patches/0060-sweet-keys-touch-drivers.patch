@@ -292,7 +292,7 @@
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 --- /dev/null
 +++ b/bsd/dev/sweet_touch.c
-@@ -0,0 +1,1124 @@
+@@ -0,0 +1,1125 @@
 +/*
 + * SWEET MT6853 SPI4 / Novatek NT36672C (oplus tp_noflash) touch bring-up.
 + * RMX2117 wiring from the stock DTBO: spi4@11018000, irq GPIO14, reset
@@ -721,6 +721,8 @@
 +	}
 +}
 +
++static bool spi_done(void);
++
 +/* DMA buffers: one cache-line-aligned bounce for each direction.  The
 + * mt65xx engine DMAs >32-byte transfers as a whole packet chain; FIFO
 + * mode stalls on the second packet (st0=0, vendor uses DMA there too). */
@@ -794,8 +796,7 @@
 +	twr(st.spi, SPI_ST0, trd(st.spi, SPI_ST0)); /* w1c */
 +	twr(st.spi, SPI_CMD, (cmd & ~SPI_RESUME) | SPI_ACT);
 +	if (!spi_done()) {
-+		printf("SWEET TOUCH: spi dma timeout st0=%#x cmd=%#x len=%u
-+",
++		printf("SWEET TOUCH: spi dma timeout st0=%#x cmd=%#x len=%u\n",
 +		    trd(st.spi, SPI_ST0), trd(st.spi, SPI_CMD), len);
 +		twr(st.spi, SPI_CMD,
 +		    trd(st.spi, SPI_CMD) & ~(SPI_CMD_TX_DMA | SPI_CMD_RX_DMA));
