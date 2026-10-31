@@ -1,6 +1,6 @@
 --- a/bsd/dev/sweet_gpu.c
 +++ b/bsd/dev/sweet_gpu.c
-@@ -40,7 +40,13 @@
+@@ -40,7 +40,14 @@
  #if defined(ARM64_BOARD_CONFIG_SWEET)
  #include <sys/param.h>
  #include <sys/systm.h>
@@ -15,7 +15,7 @@
  #include <kern/thread.h>
  #include <kern/sched_prim.h>
  #include <machine/machine_routines.h>
-@@ -916,6 +922,9 @@
+@@ -916,6 +922,10 @@
  	if (g_keep) {
  		LOG("sweetgpu_keep=1: leaving GPU powered, as0=%d cores=%d\n",
  		    g_as_mapped, g_cores_on);
@@ -26,7 +26,7 @@
  	} else {
  		gpu_power_down();
  		LOG("teardown complete (rc=%d)\n", rc);
-@@ -954,4 +963,379 @@
+@@ -954,4 +963,384 @@
  	else
  		LOG("kernel_thread_start failed %d\n", kr);
  }
