@@ -292,7 +292,7 @@
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 --- /dev/null
 +++ b/bsd/dev/sweet_touch.c
-@@ -0,0 +1,1133 @@
+@@ -0,0 +1,1121 @@
 +/*
 + * SWEET MT6853 SPI4 / Novatek NT36672C (oplus tp_noflash) touch bring-up.
 + * RMX2117 wiring from the stock DTBO: spi4@11018000, irq GPIO14, reset
@@ -845,21 +845,9 @@
 +spi_xfer(const uint8_t *tx, uint8_t *rx, unsigned len)
 +{
 +	unsigned off = 0;
-+	/* vendor: >32-byte transfers run as one DMA packet chain; the FIFO
-+	 * path is only for the <=31-byte tail. */
-+	unsigned dma_len = len & ~31u;
-+	if (dma_len) {
-+		if (!spi_dma(tx, rx, dma_len)) {
-+			return false;
-+		}
-+		off = dma_len;
-+		if (tx) {
-+			tx += dma_len;
-+		}
-+		if (rx) {
-+			rx += dma_len;
-+		}
-+	}
++	/* DMA path needs the SMI larb AHB port which LK never powers; with
++	 * LK's real clock parent kept, plain <=32B FIFO packets are enough
++	 * (the earlier chunk stalls were the same dead-mux-parent bug). */
 +	twr(st.spi, SPI_CMD, trd(st.spi, SPI_CMD) | SPI_RST);
 +	twr(st.spi, SPI_CMD, trd(st.spi, SPI_CMD) & ~SPI_RST);
 +	while (off < len) {
