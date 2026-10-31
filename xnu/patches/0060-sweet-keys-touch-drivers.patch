@@ -292,7 +292,7 @@
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 --- /dev/null
 +++ b/bsd/dev/sweet_touch.c
-@@ -0,0 +1,1155 @@
+@@ -0,0 +1,1173 @@
 +/*
 + * SWEET MT6853 SPI4 / Novatek NT36672C (oplus tp_noflash) touch bring-up.
 + * RMX2117 wiring from the stock DTBO: spi4@11018000, irq GPIO14, reset
@@ -909,8 +909,14 @@
 +	twr(st.spi, SPI_ST0, trd(st.spi, SPI_ST0)); /* w1c */
 +	spi_fill_txd(tx, n);
 +	twr(st.spi, SPI_CMD, trd(st.spi, SPI_CMD) | SPI_ACT);
++	static unsigned dbg = 0;
 +	while (off < len) {
 +		unsigned f = spi_wait_flag();
++		if (dbg < 6 && len > SPI_FIFO) {
++			printf("SWEET TOUCH: spi pkt off=%u f=%u st0=%#x st1=%#x\n",
++			    off, f, trd(st.spi, SPI_ST0), trd(st.spi, SPI_ST1));
++			dbg++;
++		}
 +		if (f == 0) {
 +			printf("SWEET TOUCH: spi flag timeout off=%u len=%u st0=%#x st1=%#x cfg1=%#x cmd=%#x\n",
 +			    off, len, trd(st.spi, SPI_ST0),
@@ -1088,11 +1094,23 @@
 +		return false;
 +	}
 +	uint32_t sram = p->sram, bin = p->bin, size = p->size + 1;
++	static int verified = 0;
 +	while (size) {
 +		unsigned len = size < NVT_XFER_LEN ? size : NVT_XFER_LEN;
 +		nvt_page(sram);
 +		if (!nvt_write((uint8_t)(sram & 0x7f), fw + bin, len)) {
 +			return false;
++		}
++		if (!verified && len >= 64) {
++			/* one-shot write-back check: did all packets land? */
++			uint8_t rb[16];
++			nvt_page(sram);
++			bool rok = nvt_read((uint8_t)(sram & 0x7f), rb, sizeof(rb));
++			printf("SWEET TOUCH: fw verify sram=%#x rok=%d rb=%02x%02x%02x%02x .. %02x%02x (want %02x%02x..%02x%02x)\n",
++			    sram, rok, rb[0], rb[1], rb[2], rb[3],
++			    rb[14], rb[15],
++			    fw[bin], fw[bin + 1], fw[bin + 14], fw[bin + 15]);
++			verified = 1;
 +		}
 +		sram += NVT_XFER_LEN;
 +		bin += NVT_XFER_LEN;
