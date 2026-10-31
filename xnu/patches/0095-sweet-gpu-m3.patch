@@ -26,7 +26,7 @@
  	} else {
  		gpu_power_down();
  		LOG("teardown complete (rc=%d)\n", rc);
-@@ -954,4 +963,384 @@
+@@ -954,4 +963,388 @@
  	else
  		LOG("kernel_thread_start failed %d\n", kr);
  }
@@ -34,7 +34,7 @@
 +/* ======================================================================
 + * M3: userland-facing GPU driver over /dev/sweetgpu
 + *
-+ * Per-fd model (devfs cdevpriv): each open() gets its own GPU address
++ * Single-context model (no cdevpriv in this xnu): open() gets an AS
 + * space (AS1..AS15; AS0 is kernel-reserved for the M2 self-test).
 + * Every address space owns a 4-level aarch64-4K page table identical to
 + * the kbase r25p0 layout used above; page-table pages come from
@@ -204,12 +204,9 @@
 +
 +/* ---- devfs entry points -------------------------------------------- */
 +
-+static int
-+static void
-+sgpu_as_release_cb(void)
-+{
-+}
++static struct sgpu_as *g_open_as;
 +
++static int
 +sgpu_open(dev_t dev, int flags, int devtype, proc_t p)
 +{
 +	struct sgpu_as *as = NULL;
@@ -217,6 +214,10 @@
 +	if (!g_dev_up)
 +		return ENXIO;
 +	lck_mtx_lock(&sgpu_dev_lock);
++	if (g_open_as) {
++		lck_mtx_unlock(&sgpu_dev_lock);
++		return EBUSY;
++	}
 +	for (int i = 1; i < SGPU_AS_MAX; ++i) {
 +		if (!g_as_table[i].used &&
 +		    (grd(g_mali, MALI_AS_PRESENT) & (1u << i))) {
@@ -237,7 +238,7 @@
 +		lck_mtx_unlock(&sgpu_dev_lock);
 +		return EIO;
 +	}
-+	devfs_set_cdevpriv(as, sgpu_as_release_cb);
++	g_open_as = as;
 +	lck_mtx_unlock(&sgpu_dev_lock);
 +	LOG("fd open: as%d\n", as->nr);
 +	return 0;
@@ -248,10 +249,12 @@
 +{
 +	struct sgpu_as *as = NULL;
 +	(void)dev; (void)flags; (void)devtype; (void)p;
-+	if (devfs_get_cdevpriv((void **)&as) || !as)
++	as = g_open_as;
++	if (!as)
 +		return 0;
 +	lck_mtx_lock(&sgpu_dev_lock);
 +	sgpu_as_release(as);
++	g_open_as = NULL;
 +	lck_mtx_unlock(&sgpu_dev_lock);
 +	return 0;
 +}
@@ -274,7 +277,8 @@
 +		return 0;
 +	}
 +	}
-+	if (devfs_get_cdevpriv((void **)&as) || !as)
++	as = g_open_as;
++	if (!as)
 +		return EBADF;
 +	lck_mtx_lock(&sgpu_dev_lock);
 +	switch (cmd) {
