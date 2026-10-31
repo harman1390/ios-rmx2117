@@ -1,6 +1,6 @@
 --- a/bsd/dev/sweet_gpu.c
 +++ b/bsd/dev/sweet_gpu.c
-@@ -1,261 +1,963 @@
+@@ -1,261 +1,965 @@
 -/*
 - * SWEET Mali-G57 (MT6853) milestone M1: power the MFG domains, ungate the
 - * mfgcfg clock and read GPU_ID.  Every register/sequence below is from
@@ -838,6 +838,7 @@
 +static int
 +mali_cores_on(void)
 +{
++	LOG("job: page tables ok, programming JS0\n");
 +	uint32_t shl = grd(g_mali, MALI_SH_PRESENT_LO);
 +	uint32_t shh = grd(g_mali, MALI_SH_PRESENT_HI);
 +	uint32_t til = grd(g_mali, MALI_TI_PRESENT_LO);
@@ -1043,6 +1044,7 @@
 +	LOG("job submitted js_head=%#llx\n", desc_pa);
 +
 +	/* wait for slot0 DONE (bit0) or FAIL (bit16) -- either terminates it */
++	LOG("job: polling irq...\n");
 +	int done = 0;
 +	for (int i = 0; i < 100000; ++i) {
 +		if (grd(g_mali, JOB_IRQ_RAWSTAT) & ((1u << 0) | (1u << 16))) {
