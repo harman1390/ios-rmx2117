@@ -292,7 +292,7 @@
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 --- /dev/null
 +++ b/bsd/dev/sweet_touch.c
-@@ -0,0 +1,1175 @@
+@@ -0,0 +1,1193 @@
 +/*
 + * SWEET MT6853 SPI4 / Novatek NT36672C (oplus tp_noflash) touch bring-up.
 + * RMX2117 wiring from the stock DTBO: spi4@11018000, irq GPIO14, reset
@@ -426,6 +426,8 @@
 +#define NVT_DLM_LEN     0x03F130u
 +#define NVT_G_ILM_CHK   0x03F100u
 +#define NVT_G_DLM_CHK   0x03F104u
++#define NVT_R_ILM_CHK   0x03F120u
++#define NVT_R_DLM_CHK   0x03F124u
 +#define NVT_CHIP_PAGE   0x1F600u
 +#define NVT_CHIP_OFF    0x4Eu
 +/* event buffer map */
@@ -1222,6 +1224,22 @@
 +		if (nvt_state_at_least(NVT_ST_INIT, 10)) {
 +			printf("SWEET TOUCH: nvt fw download ok (attempt %u)\n", attempt);
 +			return true;
++		}
++		uint8_t c[6];
++		nvt_page(NVT_R_ILM_CHK);
++		if (nvt_read(NVT_R_ILM_CHK & 0x7f, c, 5)) {
++			printf("SWEET TOUCH: r_ilm=%02x%02x%02x%02x (want %08x)\n",
++			    c[4], c[3], c[2], c[1], part[0].crc);
++		}
++		nvt_page(NVT_R_DLM_CHK);
++		if (nvt_read(NVT_R_DLM_CHK & 0x7f, c, 5)) {
++			printf("SWEET TOUCH: r_dlm=%02x%02x%02x%02x (want %08x)\n",
++			    c[4], c[3], c[2], c[1], part[1].crc);
++		}
++		nvt_page(NVT_BLD_CRC_EN);
++		b[0] = NVT_BLD_CRC_EN & 0x7f;
++		if (nvt_read(NVT_BLD_CRC_EN & 0x7f, b, 2)) {
++			printf("SWEET TOUCH: bld_crc_en=%02x\n", b[1]);
 +		}
 +	}
 +	printf("SWEET TOUCH: nvt fw download failed\n");
