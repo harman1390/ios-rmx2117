@@ -27,7 +27,7 @@
  }
 --- /dev/null
 +++ b/bsd/dev/sweet_conn.c
-@@ -0,0 +1,146 @@
+@@ -0,0 +1,223 @@
 +/*
 + * SWEET MT6853 connectivity (Wi-Fi/BT, MT6635 conninfra) milestone M0:
 + * power the CONN MTCMOS domain, release its bus protection and read the
@@ -64,6 +64,24 @@
 +#define CONN_SPM_PA     0x10006000u
 +#define CONN_INFRA_PA   0x10001000u
 +#define CONN_MCU_PA     0x18002000u /* CONN_MCU_CONFIG_BASE per consys node */
++#define CONN_PWRAP_PA   0x10026000u
++
++/* M1 additions (vendor mt6877_pmic.c common_power_ctrl): conn PMIC
++ * rails over pwrap.  OP_EN_SET regs get PMRC HW_OP_EN bits[7:4]|b0. */
++#define PMIC_VCN18_OP_EN_SET  0x1c36u
++#define PMIC_VCN13_OP_EN_SET  0x1c24u
++#define PMIC_VCN33_1_OP_EN_SET 0x1beau
++#define PMIC_VCN33_2_OP_EN_SET 0x1c10u
++#define PWRAP_ACC    0x0c80u
++#define PWRAP_WDATA  0x0c84u
++#define PWRAP_RDATA  0x0c94u
++#define PWRAP_VLDCLR 0x0ca4u
++#define PWRAP_STA    0x0ca8u
++#define PWRAP_FSM(x) (((x) >> 1) & 7u)
++#define PWRAP_IDLE   0u
++#define PWRAP_WFVLD  6u
++/* a-die hw version reg (vendor mt6877.c: read +0x02c -> 0x66358Axx) */
++#define CONNSYS_ADIE_HW_VER 0x002cu
 +
 +#define SP_PWR_STATUS   0x016cu
 +#define SP_PWR_STATUS_2 0x0170u
@@ -82,7 +100,7 @@
 +
 +#define CONNSYS_HW_IP_VER 0x0110u
 +
-+static vm_offset_t c_spm, c_infra, c_mcu;
++static vm_offset_t c_spm, c_infra, c_mcu, c_pwrap;
 +
 +static uint32_t
 +crd(vm_offset_t base, uint32_t off)
@@ -99,11 +117,62 @@
 +	__asm__ volatile("dsb sy" ::: "memory");
 +}
 +
++static int
++cpwait(uint32_t want)
++{
++	for (int i = 0; i < 1000; ++i) {
++		if (PWRAP_FSM(crd(c_pwrap, PWRAP_STA)) == want)
++			return 0;
++		delay(1);
++	}
++	return -1;
++}
++
++static int
++cpmic_r(uint32_t adr, uint32_t *out)
++{
++	if (cpwait(PWRAP_IDLE)) {
++		if (PWRAP_FSM(crd(c_pwrap, PWRAP_STA)) == PWRAP_WFVLD)
++			cwr(c_pwrap, PWRAP_VLDCLR, 1);
++		return -1;
++	}
++	cwr(c_pwrap, PWRAP_ACC, adr);
++	if (cpwait(PWRAP_WFVLD))
++		return -2;
++	*out = crd(c_pwrap, PWRAP_RDATA) & 0xffffu;
++	cwr(c_pwrap, PWRAP_VLDCLR, 1);
++	return 0;
++}
++
++static int
++cpmic_w(uint32_t adr, uint32_t v)
++{
++	if (cpwait(PWRAP_IDLE))
++		return -1;
++	cwr(c_pwrap, PWRAP_WDATA, v & 0xffffu);
++	cwr(c_pwrap, PWRAP_ACC, (1u << 29) | adr);
++	return cpwait(PWRAP_IDLE) ? -2 : 0;
++}
++
 +static void
 +conn_thread(void *arg, wait_result_t result)
 +{
 +	(void)arg;
 +	(void)result;
++
++	/* M1: conn PMIC rails first (vendor common_power_ctrl order:
++	 * VCN18 1.8V then VCN13 1.3V, PMRC HW_OP_EN[7:4]|SW b0) */
++	extern void sweet_pwrap_lock(void);
++	extern void sweet_pwrap_unlock(void);
++	sweet_pwrap_lock();
++	int rok = 1;
++	rok &= (cpmic_w(PMIC_VCN18_OP_EN_SET,   0xf1) == 0);
++	rok &= (cpmic_w(PMIC_VCN13_OP_EN_SET,   0xf1) == 0);
++	rok &= (cpmic_w(PMIC_VCN33_1_OP_EN_SET, 0xf1) == 0);
++	rok &= (cpmic_w(PMIC_VCN33_2_OP_EN_SET, 0xf1) == 0);
++	sweet_pwrap_unlock();
++	printf("SWEET CONN: pmic rails %s (vcn18/13/33_1/33_2)\n",
++	    rok ? "on" : "FAIL");
 +
 +	/* power on CONN domain (vendor order) */
 +	uint32_t v = crd(c_spm, SP_CONN_CON);
@@ -135,10 +204,17 @@
 +	cwr(c_infra, PROTEN_CLR,   0x00042000u); /* STEP1_0 b13|b18  */
 +	printf("SWEET CONN: bus prot released\n");
 +
-+	/* read the conninfra hardware IP version */
++	/* read the conninfra hardware IP version + a-die id (vendor
++	 * polls +0x02c until nonzero -> 0x66358A00/10/11 for MT6635) */
 +	delay(1000);
 +	uint32_t ip = crd(c_mcu, CONNSYS_HW_IP_VER);
-+	printf("SWEET CONN: CONNSYS_HW_IP_VER=%#08x\n", ip);
++	uint32_t adie = 0;
++	for (int i = 0; i < 5000 &&
++	    ((adie = crd(c_mcu, CONNSYS_ADIE_HW_VER)) == 0 ||
++	     adie == 0xffffffffu); ++i)
++		delay(10);
++	printf("SWEET CONN: CONNSYS_HW_IP_VER=%#08x adie_hw_ver=%#08x\n",
++	    ip, adie);
 +	printf("SWEET CONN: note - iOS has no wlan/bt stack for this MAC; "
 +	    "probe only proves power path (see NOTES.md)\n");
 +out:
@@ -163,7 +239,8 @@
 +	c_spm = ml_io_map(CONN_SPM_PA, 0x1000);
 +	c_infra = ml_io_map(CONN_INFRA_PA, 0x1000);
 +	c_mcu = ml_io_map(CONN_MCU_PA, 0x1000);
-+	if (!c_spm || !c_infra || !c_mcu) {
++	c_pwrap = ml_io_map(CONN_PWRAP_PA, 0x1000);
++	if (!c_spm || !c_infra || !c_mcu || !c_pwrap) {
 +		printf("SWEET CONN: MMIO map failed\n");
 +		return;
 +	}

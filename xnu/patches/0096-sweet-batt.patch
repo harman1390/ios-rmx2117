@@ -247,7 +247,7 @@
 +
 +static const struct cdevsw batt_cdevsw = {
 +	.d_open = batt_open,
-+	.d_close = eno_close,
++	.d_close = eno_opcl,
 +	.d_read = batt_read,
 +	.d_ioctl = eno_ioctl,
 +	.d_stop = eno_stop,

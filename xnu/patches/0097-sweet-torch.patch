@@ -244,7 +244,7 @@
 +
 +/* sysctl kern.sweettorch: read current level, write 0..31 */
 +static int
-+sysctl_torch(SYSCTL_HANDLER_ARGS)
++sysctl_torch(struct sysctl_oid *oidp, void *arg1, int arg2, struct sysctl_req *req)
 +{
 +	int val = g_level, error;
 +	(void)oidp; (void)arg1; (void)arg2;
@@ -269,12 +269,18 @@
 +	if (uiomove(buf, len, uio))
 +		return EFAULT;
 +	buf[len] = 0;
-+	return sweet_torch_set((int)simple_strtol(buf, NULL, 10)) ? EIO : 0;
++	{
++		long v = 0;
++		const char *p;
++		for (p = buf; *p >= '0' && *p <= '9'; p++)
++			v = v * 10 + (*p - '0');
++		return sweet_torch_set((int)v) ? EIO : 0;
++	}
 +}
 +
 +static const struct cdevsw torch_cdevsw = {
-+	.d_open = eno_open,
-+	.d_close = eno_close,
++	.d_open = eno_opcl,
++	.d_close = eno_opcl,
 +	.d_write = torch_write,
 +	.d_ioctl = eno_ioctl,
 +	.d_stop = eno_stop,
