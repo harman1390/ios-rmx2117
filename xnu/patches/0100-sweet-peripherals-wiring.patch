@@ -22,8 +22,9 @@
  }
 --- a/bsd/conf/files
 +++ b/bsd/conf/files
-@@ -115,2 +115,6 @@
+@@ -111,3 +111,7 @@
  bsd/dev/sweet_conn.c		standard
+ bsd/dev/sweet_nvt_fw.c		standard
 +bsd/dev/sweet_batt.c		standard
 +bsd/dev/sweet_torch.c		standard
 +bsd/dev/sweet_cam.c	standard
