@@ -1,0 +1,103 @@
+diff --git a/iokit/Kernel/arm/SweetFramebuffer.cpp b/iokit/Kernel/arm/SweetFramebuffer.cpp
+index 0000000..0000000 100644
+--- a/iokit/Kernel/arm/SweetFramebuffer.cpp
++++ b/iokit/Kernel/arm/SweetFramebuffer.cpp
+@@ -85,7 +85,7 @@
+ #define SWEET_FB_LOGICAL_H              2436
+ #define SWEET_FB_FORMAT_BGRA            0x42475241
+ 
+-/* rmx2117 (MT6853): disp_ovl0_2l feeds the panel -- its layer 1 DMAs
++/* rmx2117 (MT6853): disp_ovl0_2l feeds the panel -- an enabled layer
+  * fPhys to the DSI cmd-mode pipe today. dsi0 needs a DSI_START (+0x0C)
+  * 0->1 toggle per frame. Addresses from research/rmt6853/mt6853-src.dts
+  * and the vendor kernel's mtk_disp_ovl.c. */
+@@ -135,7 +135,8 @@
+ 	volatile uint32_t *fOVL;      /* disp_ovl0_2l regs: direct scanout */
+ 	volatile uint32_t *fDSI;      /* dsi0 regs: cmd-mode frame kick */
+ 	SweetSurface *fScan[2];       /* surfaces OVL L1 reads (cur, prev) */
+-	uint32_t      fScanPitch;     /* pitch programmed into OVL L1 */
++	uint32_t      fScanPitch;     /* pitch programmed into the OVL layer */
++	uint32_t      fScanLayer;     /* OVL layer index that scans fPhys */
+ 	uint32_t      fDirect;        /* sweetfb_direct: DMA the surface, no copy */
+ 	uint32_t      fDirectMiss;    /* frames that fell back to the copy */
+ 	uint32_t      fStatDirect;    /* presents done by OVL scanout */
+@@ -234,16 +235,27 @@
+ 	if (fOVL != NULL) {
+ 		uint32_t en = fOVL[SWEET_OVL_EN / 4];
+ 		uint32_t src_con = fOVL[SWEET_OVL_SRC_CON / 4];
+-		uint32_t l_addr = fOVL[SWEET_OVL_L_ADDR(1) / 4];
+-		uint32_t l_pitch = fOVL[SWEET_OVL_L_PITCH(1) / 4];
+-		uint32_t l_pitchmsb = fOVL[SWEET_OVL_L_PITCH_MSB(1) / 4];
+-		IOLog("SWEET FB: ovl0_2l en 0x%x src_con 0x%x L1 addr 0x%x pitch 0x%x msb 0x%x\n",
+-		    en, src_con, l_addr, l_pitch, l_pitchmsb);
+-		fScanPitch = l_pitch & 0xffff;
+-		if (!(en & 1) || !(src_con & (1u << 1)) ||
+-		    l_addr != (uint32_t)fPhys || fScanPitch != fRowBytes ||
+-		    (l_pitchmsb & 0xf) != ((fRowBytes >> 16) & 0xf)) {
+-			IOLog("SWEET FB: ovl0_2l L1 not scanning this fb; direct off\n");
++		fScanLayer = 0xffffffffu;
++		for (uint32_t l = 0; l < 4; l++) {
++			uint32_t la = fOVL[SWEET_OVL_L_ADDR(l) / 4];
++			uint32_t lp = fOVL[SWEET_OVL_L_PITCH(l) / 4];
++			IOLog("SWEET FB: ovl0_2l en 0x%x src_con 0x%x L%u addr 0x%x pitch 0x%x\n",
++			    en, src_con, l, la, lp);
++			if ((src_con & (1u << l)) && la == (uint32_t)fPhys &&
++			    (lp & 0xffff) == fRowBytes) {
++				fScanLayer = l;
++			}
++		}
++		volatile uint32_t *rdma =
++		    (volatile uint32_t *)ml_io_map(0x14007000, 0x1000);
++		if (rdma != NULL) {
++			IOLog("SWEET FB: rdma0 en 0x%x mem_con 0x%x start 0x%x pitch 0x%x\n",
++			    rdma[0x10 / 4], rdma[0x24 / 4],
++			    rdma[0xf00 / 4], rdma[0x2c / 4]);
++		}
++		fScanPitch = fRowBytes;
++		if (!(en & 1) || fScanLayer == 0xffffffffu) {
++			IOLog("SWEET FB: ovl0_2l no layer scanning this fb; direct off\n");
+ 			fDirect = 0;
+ 		}
+ 	} else {
+@@ -309,10 +321,10 @@
+ 			 * a CA surface, point it back here first. Keep the
+ 			 * previous buffer alive one more frame like present(). */
+ 			if (fb->fOVL != NULL && fb->fScan[0] != NULL) {
+-				fb->fOVL[SWEET_OVL_L_ADDR(1) / 4] = (uint32_t)fb->fPhys;
++				fb->fOVL[SWEET_OVL_L_ADDR(fb->fScanLayer) / 4] = (uint32_t)fb->fPhys;
+ 				if (fb->fScanPitch != fb->fRowBytes) {
+-					fb->fOVL[SWEET_OVL_L_PITCH(1) / 4] = fb->fRowBytes;
+-					fb->fOVL[SWEET_OVL_L_PITCH_MSB(1) / 4] = 0;
++					fb->fOVL[SWEET_OVL_L_PITCH(fb->fScanLayer) / 4] = fb->fRowBytes;
++					fb->fOVL[SWEET_OVL_L_PITCH_MSB(fb->fScanLayer) / 4] = 0;
+ 					fb->fScanPitch = fb->fRowBytes;
+ 				}
+ 				OSSynchronizeIO();
+@@ -504,10 +516,10 @@
+ 			}
+ 		}
+ 		if (addr != 0) {
+-			fOVL[SWEET_OVL_L_ADDR(1) / 4] = (uint32_t)addr;
++			fOVL[SWEET_OVL_L_ADDR(fScanLayer) / 4] = (uint32_t)addr;
+ 			if (pitch != fScanPitch) {
+-				fOVL[SWEET_OVL_L_PITCH(1) / 4] = pitch;
+-				fOVL[SWEET_OVL_L_PITCH_MSB(1) / 4] = 0;
++				fOVL[SWEET_OVL_L_PITCH(fScanLayer) / 4] = pitch;
++				fOVL[SWEET_OVL_L_PITCH_MSB(fScanLayer) / 4] = 0;
+ 				fScanPitch = pitch;
+ 			}
+ 			OSSynchronizeIO();
+@@ -538,10 +550,10 @@
+ 	 * fPhys: it may still be scanning the previous direct surface, and
+ 	 * the pixels memcpy'd below land in fPhys, not there. */
+ 	if (fOVL != NULL && fScan[0] != NULL) {
+-		fOVL[SWEET_OVL_L_ADDR(1) / 4] = (uint32_t)fPhys;
++		fOVL[SWEET_OVL_L_ADDR(fScanLayer) / 4] = (uint32_t)fPhys;
+ 		if (fScanPitch != fRowBytes) {
+-			fOVL[SWEET_OVL_L_PITCH(1) / 4] = fRowBytes;
+-			fOVL[SWEET_OVL_L_PITCH_MSB(1) / 4] = 0;
++			fOVL[SWEET_OVL_L_PITCH(fScanLayer) / 4] = fRowBytes;
++			fOVL[SWEET_OVL_L_PITCH_MSB(fScanLayer) / 4] = 0;
+ 			fScanPitch = fRowBytes;
+ 		}
+ 		OSSynchronizeIO();

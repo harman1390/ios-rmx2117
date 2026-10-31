@@ -292,7 +292,7 @@
 +#endif /* ARM64_BOARD_CONFIG_SWEET */
 --- /dev/null
 +++ b/bsd/dev/sweet_touch.c
-@@ -0,0 +1,1012 @@
+@@ -0,0 +1,1016 @@
 +/*
 + * SWEET MT6853 SPI4 / Novatek NT36672C (oplus tp_noflash) touch bring-up.
 + * RMX2117 wiring from the stock DTBO: spi4@11018000, irq GPIO14, reset
@@ -770,7 +770,11 @@
 +			twr(st.spi, SPI_TXD, v);
 +		}
 +		twr(st.spi, SPI_ST0, trd(st.spi, SPI_ST0)); /* w1c */
-+		twr(st.spi, SPI_CMD, trd(st.spi, SPI_CMD) | SPI_ACT);
++		/* vendor mtk_spi_enable_transfer: the engine PAUSES after each
++		 * packet; continuing the same transfer needs RESUME, a fresh
++		 * ACT is ignored and the packet never completes (st0=0). */
++		twr(st.spi, SPI_CMD, trd(st.spi, SPI_CMD) |
++		    (off == 0 ? SPI_ACT : SPI_RESUME));
 +		if (!spi_done()) {
 +			printf("SWEET TOUCH: spi finish timeout st0=%#x cmd=%#x\n",
 +			    trd(st.spi, SPI_ST0), trd(st.spi, SPI_CMD));
