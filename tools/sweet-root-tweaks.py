@@ -148,6 +148,27 @@ def posterboard(root):
     print('PosterBoard disabled')
 
 
+def appreg(root):
+    # /Applications never registers: lsd (user) runs but installd and
+    # lsd.system are XPC-on-demand and nothing triggers the system-app
+    # scan -> only baked-in icons appear. RunAtLoad forces one scan pass
+    # at boot; lsd.system then catalogues /Applications and installd
+    # builds the containers. Harmless if the trigger was already firing.
+    for label in ('com.apple.lsd.system', 'com.apple.mobile.installd'):
+        conf = os.path.join(root, 'System/Library/LaunchDaemons/%s.plist' % label)
+        if not os.path.exists(conf):
+            print('warning: no %s job plist; skipped' % label)
+            continue
+        st = os.stat(conf)
+        data = load(conf)
+        if data.get('RunAtLoad'):
+            print('%s already RunAtLoad' % label)
+            continue
+        data['RunAtLoad'] = True
+        save(conf, data, st.st_uid, st.st_gid, st.st_mode & 0o7777, plistlib.FMT_XML)
+        print('%s: RunAtLoad set' % label)
+
+
 def main():
     if len(sys.argv) != 2 or not os.path.isdir(os.path.join(sys.argv[1], 'System/Library/xpc')):
         sys.exit(__doc__)
@@ -157,6 +178,7 @@ def main():
     activation(root)
     audio(root)
     posterboard(root)
+    appreg(root)
     merge_pref(root, 'com.apple.migration', {
         'LastSystemVersion': BUILD,
         'DMUserDataDisposition': {'SyntheticDidUpgrade': False, 'buildVersion': BUILD}})
