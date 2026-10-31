@@ -1,0 +1,22 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -54,6 +54,10 @@
+ extern void sweet_usb_probe(void);
+ extern void sweet_gpu_init(void);
+ extern void sweet_conn_init(void);
++extern void sweet_batt_init(void);
++extern void sweet_torch_init(void);
++extern void sweet_cam_init(void);
++extern void sweet_mic_init(void);
+ 
+ #define REG_CAP         0x00
+@@ -689,6 +693,10 @@
+ 	sweet_usb_probe();
+ 	sweet_gpu_init();
+ 	sweet_conn_init();
++	sweet_batt_init();
++	sweet_torch_init();
++	sweet_cam_init();
++	sweet_mic_init();
+ 	return 0;
+ }
