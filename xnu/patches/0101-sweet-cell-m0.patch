@@ -1,0 +1,260 @@
+--- a/bsd/dev/sweet_ufs.c
++++ b/bsd/dev/sweet_ufs.c
+@@ -60,6 +60,7 @@
+ extern void sweet_torch_init(void);
+ extern void sweet_cam_init(void);
+ extern void sweet_mic_init(void);
++extern void sweet_cell_init(void);
+ 
+ #define REG_CAP         0x00
+ #define REG_IS          0x20
+@@ -697,6 +698,7 @@
+ 	sweet_torch_init();
+ 	sweet_cam_init();
+ 	sweet_mic_init();
++	sweet_cell_init();
+ 	return 0;
+ }
+ 
+--- a/bsd/conf/files
++++ b/bsd/conf/files
+@@ -118,6 +118,7 @@
+ bsd/dev/sweet_torch.c			standard
+ bsd/dev/sweet_cam.c			standard
+ bsd/dev/sweet_mic.c			standard
++bsd/dev/sweet_cell.c			standard
+ bsd/dev/mem.c				standard
+ bsd/dev/munge.c 			optional config_requires_u32_munging
+ bsd/dev/unix_startup.c			standard
+--- /dev/null
++++ b/bsd/dev/sweet_cell.c
+@@ -0,0 +1,229 @@
++/*
++ * SWEET cellular probe for MT6853 (RMX2117) -- MD1 modem domain M0.
++ *
++ * Powers the integrated MD1 5G-modem power domain and its bus-protect
++ * release, enables the VMODEM buck rail, and reads the md2md CCIF
++ * status window.  All register steps are transcribed from vendor
++ * clk-mt6853-pg.c (spm_mtcmos_ctrl_md1_pwr / _md1_bus_prot) and
++ * mt6359p/registers.h -- nothing is guessed.
++ *
++ *   SPM 0x10006000: MD1_PWR_CON=0x300, PWR_STATUS=0x16c/0x170 bit0
++ *   PWR_CON bits:   RST_B=b0 ISO=b1 ON=b2 ON_2ND=b3 CLK_DIS=b4
++ *                   SRAM_PDN=b8 SRAM_PDN_ACK=b12
++ *   MD1 protect release (vendor ignores ack on release):
++ *     STEP2_0 -> VDNR_CLR (infracfg 0xb88) mask b2|b12|b20 (0x101004)
++ *     STEP1_0 -> PROTEN_CLR (0x2a4)          mask b7       (0x80)
++ *   Rail: MT6359_BUCK_VMODEM_OP_EN_SET(0x1696) bit0 (SW enable) +
++ *         PMRC HW_OP_EN bits[7:4] like the conn vendor sequence.
++ *   Status: md2md_md1_ccif0 @0x10211000 window + MD1 stat regs.
++ *
++ * This is a silicon probe: the MD still needs its firmware image from
++ * the md1img partition plus the ccci/ccmni stack and an iOS-facing
++ * baseband interface that does not exist.  Boot-arg sweetcell=1
++ * (default off).
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <machine/machine_routines.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern void sweet_pwrap_lock(void);
++extern void sweet_pwrap_unlock(void);
++void sweet_cell_init(void);
++
++#define CELL_SPM_PA    0x10006000u
++#define CELL_INFRA_PA  0x10001000u
++#define CELL_PWRAP_PA  0x10026000u
++#define CELL_CCIF_PA   0x10211000u /* md2md_md1_ccif0 */
++
++#define SP_PWR_STATUS   0x016cu
++#define SP_PWR_STATUS_2 0x0170u
++#define SP_MD1_CON      0x0300u
++#define PWC_RST_B       (1u << 0)
++#define PWC_ISO         (1u << 1)
++#define PWC_ON          (1u << 2)
++#define PWC_ON_2ND      (1u << 3)
++#define PWC_CLK_DIS     (1u << 4)
++#define PWC_SRAM_PDN    (1u << 8)
++#define PWC_SRAM_ACK    (1u << 12)
++#define STA_MD1         (1u << 0)
++
++#define PROTEN_CLR      0x02a4u
++#define PROTEN_VDNR_CLR 0x0b88u
++#define MD1_STEP1_0     0x00000080u /* b7  */
++#define MD1_STEP2_0     0x00101004u /* b2|b12|b20 */
++
++#define PMIC_VMODEM_CON0      0x1688u
++#define PMIC_VMODEM_OP_EN_SET 0x1696u
++
++#define PWRAP_ACC    0x0c80u
++#define PWRAP_WDATA  0x0c84u
++#define PWRAP_RDATA  0x0c94u
++#define PWRAP_VLDCLR 0x0ca4u
++#define PWRAP_STA    0x0ca8u
++#define PWRAP_FSM(x) (((x) >> 1) & 7u)
++#define PWRAP_IDLE   0u
++#define PWRAP_WFVLD  6u
++
++static vm_offset_t g_spm, g_infra, g_pwrap, g_ccif;
++static int g_started;
++
++static uint32_t
++rd(vm_offset_t b, uint32_t o)
++{
++	uint32_t v = *(volatile uint32_t *)(b + o);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++wr(vm_offset_t b, uint32_t o, uint32_t v)
++{
++	*(volatile uint32_t *)(b + o) = v;
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++static int
++pwait(uint32_t want)
++{
++	for (int i = 0; i < 1000; ++i) {
++		if (PWRAP_FSM(rd(g_pwrap, PWRAP_STA)) == want)
++			return 0;
++		delay(1);
++	}
++	return -1;
++}
++
++static int
++pmic_r(uint32_t adr, uint32_t *out)
++{
++	if (pwait(PWRAP_IDLE)) {
++		if (PWRAP_FSM(rd(g_pwrap, PWRAP_STA)) == PWRAP_WFVLD)
++			wr(g_pwrap, PWRAP_VLDCLR, 1);
++		return -1;
++	}
++	wr(g_pwrap, PWRAP_ACC, adr);
++	if (pwait(PWRAP_WFVLD))
++		return -2;
++	*out = rd(g_pwrap, PWRAP_RDATA) & 0xffffu;
++	wr(g_pwrap, PWRAP_VLDCLR, 1);
++	return 0;
++}
++
++static int
++pmic_w(uint32_t adr, uint32_t v)
++{
++	if (pwait(PWRAP_IDLE))
++		return -1;
++	wr(g_pwrap, PWRAP_WDATA, v & 0xffffu);
++	wr(g_pwrap, PWRAP_ACC, (1u << 29) | adr);
++	return pwait(PWRAP_IDLE) ? -2 : 0;
++}
++
++static int
++md_wait_sta(int on)
++{
++	for (int i = 0; i < 20000; ++i) {
++		if ((rd(g_spm, SP_PWR_STATUS) & STA_MD1) == (on ? STA_MD1 : 0) &&
++		    (rd(g_spm, SP_PWR_STATUS_2) & STA_MD1) == (on ? STA_MD1 : 0))
++			return 0;
++		delay(1);
++	}
++	return -1;
++}
++
++/* vendor power-on: ON|ON_2ND -> wait both status -> ~CLK_DIS -> ~ISO -> RST_B */
++static int
++md1_pwr_on(void)
++{
++	wr(g_spm, SP_MD1_CON, rd(g_spm, SP_MD1_CON) | PWC_ON);
++	wr(g_spm, SP_MD1_CON, rd(g_spm, SP_MD1_CON) | PWC_ON_2ND);
++	if (md_wait_sta(1)) {
++		printf("SWEET CELL: md1 power-on timeout con=%#x sta=%#x/%#x\n",
++		    rd(g_spm, SP_MD1_CON), rd(g_spm, SP_PWR_STATUS),
++		    rd(g_spm, SP_PWR_STATUS_2));
++		return -1;
++	}
++	wr(g_spm, SP_MD1_CON, rd(g_spm, SP_MD1_CON) & ~PWC_CLK_DIS);
++	wr(g_spm, SP_MD1_CON, rd(g_spm, SP_MD1_CON) & ~PWC_ISO);
++	wr(g_spm, SP_MD1_CON, rd(g_spm, SP_MD1_CON) | PWC_RST_B);
++	/* vendor drops SRAM_PDN for md on power-up */
++	wr(g_spm, SP_MD1_CON, rd(g_spm, SP_MD1_CON) & ~PWC_SRAM_PDN);
++	for (int i = 0; i < 20000 &&
++	    (rd(g_spm, SP_MD1_CON) & PWC_SRAM_ACK); ++i)
++		delay(1);
++	return 0;
++}
++
++static void
++cell_thread(void *arg, wait_result_t result)
++{
++	uint32_t v = 0;
++	(void)arg;
++	(void)result;
++
++	/* VMODEM buck rail: SW op_en + PMRC HW_OP_EN[7:4] (vendor shape) */
++	sweet_pwrap_lock();
++	int ok = 1;
++	ok &= (pmic_w(PMIC_VMODEM_OP_EN_SET, 0xf1) == 0); /* b7..b4|b0 */
++	ok &= (pmic_r(PMIC_VMODEM_CON0, &v) == 0);
++	sweet_pwrap_unlock();
++	printf("SWEET CELL: vmodem op_en %s con0=%#x\n",
++	    ok ? "ok" : "FAIL", v);
++	if (!ok)
++		return;
++
++	if (md1_pwr_on()) {
++		printf("SWEET CELL: md1 domain failed, leaving vmodem on\n");
++		return;
++	}
++	printf("SWEET CELL: md1 domain on, con=%#x\n",
++	    rd(g_spm, SP_MD1_CON));
++
++	/* bus-protect release (vendor order: STEP2 VDNR then STEP1) */
++	wr(g_infra, PROTEN_VDNR_CLR, MD1_STEP2_0);
++	wr(g_infra, PROTEN_CLR, MD1_STEP1_0);
++	printf("SWEET CELL: bus prot released, sta1=%#x vdnr_sta1=%#x\n",
++	    rd(g_infra, 0x0228), rd(g_infra, 0x0b90));
++
++	/* alive check: md2md ccif window + md status block */
++	delay(5000);
++	printf("SWEET CELL: ccif[0x10211000] = %08x %08x %08x %08x\n",
++	    rd(g_ccif, 0x00), rd(g_ccif, 0x04),
++	    rd(g_ccif, 0x08), rd(g_ccif, 0x0c));
++	printf("SWEET CELL: done (MD still needs md1img fw + ccci -- "
++	    "documented follow-on)\n");
++}
++
++void
++sweet_cell_init(void)
++{
++	int enabled = 0;
++	thread_t thread;
++	if (g_started)
++		return;
++	g_started = 1;
++	(void)PE_parse_boot_argn("sweetcell", &enabled, sizeof(enabled));
++	if (!enabled) {
++		printf("SWEET CELL: off (sweetcell=1 to probe MD1)\n");
++		return;
++	}
++	g_spm = ml_io_map(CELL_SPM_PA, 0x1000);
++	g_infra = ml_io_map(CELL_INFRA_PA, 0x1000);
++	g_pwrap = ml_io_map(CELL_PWRAP_PA, 0x1000);
++	g_ccif = ml_io_map(CELL_CCIF_PA, 0x1000);
++	if (!g_spm || !g_infra || !g_pwrap || !g_ccif) {
++		printf("SWEET CELL: map failed\n");
++		return;
++	}
++	kern_return_t kr = kernel_thread_start(cell_thread, NULL, &thread);
++	if (kr == KERN_SUCCESS)
++		thread_deallocate(thread);
++	else
++		printf("SWEET CELL: thread failed %d\n", kr);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
