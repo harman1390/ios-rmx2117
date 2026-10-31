@@ -1110,15 +1110,20 @@
 +static void
 +gpu_thread(void *arg, wait_result_t result)
 +{
++	LOG("gpu_thread start
+");
 +	int rc = 0;
 +	(void)arg;
 +	(void)result;
 +
-+	/* phase 1: rails */
++	LOG("phase1 rails
+");
 +	rc = gpu_pmic_up();
 +	if (rc)
 +		goto out;
 +
++	LOG("phase2 mtcmos
+");
 +	/* phase 2: MTCMOS, children of MFG1 after it */
 +	if (mfg_pwr_on(0, SP_MFG0_CON, STA_MFG0, "mfg0") ||
 +	    mfg_pwr_on(1, SP_MFG1_CON, STA_MFG1, "mfg1") ||
@@ -1130,12 +1135,16 @@
 +		goto out;
 +	}
 +
++	LOG("phase3 cg
+");
 +	/* phase 3: clock gates */
 +	if (gpu_cg_on()) {
 +		rc = -11;
 +		goto out;
 +	}
 +
++	LOG("phase4 mali
+");
 +	/* phase 4: mali init */
 +	uint32_t id = grd(g_mali, MALI_GPU_ID);
 +	LOG("GPU_ID=%#08x AS=%#x JS=%#x L2f=%#x COREf=%#x MMUf=%#x\n",
@@ -1153,6 +1162,8 @@
 +		goto out;
 +	}
 +
++	LOG("phase5 selftest
+");
 +	/* phase 5: M2 self-test */
 +	if (g_nojob) {
 +		LOG("sweetgpu_nojob=1, stopping after core power-on\n");
