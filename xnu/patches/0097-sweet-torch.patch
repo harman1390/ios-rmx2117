@@ -1,6 +1,6 @@
 --- /dev/null
 +++ b/bsd/dev/sweet_torch.c
-@@ -0,0 +1,311 @@
+@@ -0,0 +1,317 @@
 +/*
 + * SWEET torch/flashlight driver for RMX2117 (MT6853).
 + *
