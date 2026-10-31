@@ -1,0 +1,406 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -40,7 +40,13 @@
+ #if defined(ARM64_BOARD_CONFIG_SWEET)
+ #include <sys/param.h>
+ #include <sys/systm.h>
++#include <sys/conf.h>
++#include <sys/ioccom.h>
++#include <sys/proc.h>
++#include <sys/uio.h>
++#include <miscfs/devfs/devfs.h>
+ #include <kern/clock.h>
++#include <kern/locks.h>
+ #include <kern/thread.h>
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+@@ -916,6 +922,9 @@
+ 	if (g_keep) {
+ 		LOG("sweetgpu_keep=1: leaving GPU powered, as0=%d cores=%d\n",
+ 		    g_as_mapped, g_cores_on);
++	} else if (!rc && !g_nojob) {
++		/* bring-up + self-test passed: stay powered and serve userland */
++		sweet_gpu_devfs_register();
+ 	} else {
+ 		gpu_power_down();
+ 		LOG("teardown complete (rc=%d)\n", rc);
+@@ -954,4 +963,379 @@
+ 	else
+ 		LOG("kernel_thread_start failed %d\n", kr);
+ }
++
++/* ======================================================================
++ * M3: userland-facing GPU driver over /dev/sweetgpu
++ *
++ * Per-fd model (devfs cdevpriv): each open() gets its own GPU address
++ * space (AS1..AS15; AS0 is kernel-reserved for the M2 self-test).
++ * Every address space owns a 4-level aarch64-4K page table identical to
++ * the kbase r25p0 layout used above; page-table pages come from
++ * kmem_alloc (each table is one page, wired, page-aligned).
++ *
++ * Buffers are physically-contiguous kmem_alloc_contig regions mapped
++ * identity-style (GPU VA == PA), the same convention the M2 test uses.
++ *
++ * Submission: SUBMIT takes a job-chain GPU VA + slot + JS_CONFIG extras;
++ * the kernel validates the chain head against the fd's buffers, submits
++ * through the AS, and polls JOB_IRQ_RAWSTAT for DONE|FAIL.  All submits
++ * are serialised on one mutex for now -- job-slot interleave comes
++ * later, together with IRQ-driven completion.
++ *
++ * ABI (also mirrored in tools/sweetgpu.h for userland):
++ */
++struct sgpu_info {
++	uint32_t gpu_id;
++	uint32_t as_present;
++	uint32_t js_present;
++	uint32_t sh_present;
++};
++struct sgpu_alloc {
++	uint32_t npages;
++	uint32_t flags;      /* reserved, must be 0 */
++	uint64_t gva;        /* out: GPU VA (== phys addr) */
++	uint64_t handle;     /* out: free token */
++};
++struct sgpu_free {
++	uint64_t handle;
++};
++struct sgpu_submit {
++	uint64_t jc;         /* job-chain head, GPU VA owned by this fd */
++	uint32_t js;         /* job slot 0..15 (validated against JS_PRESENT) */
++	uint32_t cfg;        /* JS_CONFIG extras (flush bits, pri, etc.) */
++	uint32_t timeout_ms;
++	uint32_t status;     /* out: JS_STATUS */
++	uint64_t fault_va;   /* out: AS fault address, if any */
++	uint32_t fault_st;   /* out: AS FAULTSTATUS */
++	uint32_t done;       /* out: 1=ran, 0=timeout */
++};
++#define SGPU_IOC_INFO      _IOR('G', 0, struct sgpu_info)
++#define SGPU_IOC_ALLOC     _IOWR('G', 1, struct sgpu_alloc)
++#define SGPU_IOC_FREE      _IOW('G', 2, struct sgpu_free)
++#define SGPU_IOC_SUBMIT    _IOWR('G', 3, struct sgpu_submit)
++#define SGPU_IOC_FAULTDUMP _IO('G', 4)
++
++#define SGPU_AS_MAX        16
++#define SGPU_PT_POOL       32      /* max sub-tables per address space */
++#define SGPU_BO_MAX        64      /* max live buffers per fd */
++
++struct sgpu_bo {
++	uint64_t pa;
++	vm_offset_t va;
++	uint32_t npages;
++	uint8_t used;
++};
++
++struct sgpu_as {
++	uint8_t used;
++	uint8_t nr;
++	uint16_t pt_used;
++	vm_offset_t pt_va[SGPU_PT_POOL]; /* [0] = L0 */
++	uint64_t pt_pa[SGPU_PT_POOL];
++	struct sgpu_bo bo[SGPU_BO_MAX];
++};
++
++static struct sgpu_as g_as_table[SGPU_AS_MAX];
++static int g_dev_up, g_cdev_major = -1;
++static LCK_GRP_DECLARE(sgpu_dev_grp, "sweetgpu_dev");
++static LCK_MTX_DECLARE(sgpu_dev_lock, &sgpu_dev_grp);
++
++/* ---- per-AS page-table helpers ------------------------------------ */
++
++static int
++sgpu_pt_new(struct sgpu_as *as)
++{
++	vm_offset_t va;
++	if (as->pt_used >= SGPU_PT_POOL)
++		return -1;
++	if (kmem_alloc(kernel_map, &va, 0x1000) != KERN_SUCCESS)
++		return -1;
++	ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)va);
++	if (!pn) {
++		kmem_free(kernel_map, va, 0x1000);
++		return -1;
++	}
++	bzero((void *)va, 0x1000);
++	as->pt_va[as->pt_used] = va;
++	as->pt_pa[as->pt_used] = ptoa_64(pn);
++	return as->pt_used++;
++}
++
++/* map one 4K page in this AS; returns -1 on pool exhaustion */
++static int
++sgpu_map_page(struct sgpu_as *as, uint64_t pa)
++{
++	uint64_t tbl = as->pt_pa[0];
++	for (int level = 0; level < 3; ++level) {
++		int idx = (int)((pa >> (39 - 9 * level)) & 0x1ff);
++		volatile uint64_t *e;
++		vm_offset_t tva = 0;
++		for (int i = 0; i < as->pt_used; ++i)
++			if (as->pt_pa[i] == tbl) { tva = as->pt_va[i]; break; }
++		e = (volatile uint64_t *)tva + idx;
++		if (!(*e & 1)) {
++			int ti = sgpu_pt_new(as);
++			if (ti < 0)
++				return -1;
++			*e = as->pt_pa[ti] | PTE_ACCESS | PTE_TABLE;
++		}
++		tbl = *e & ~0xfffull;
++	}
++	vm_offset_t tva = 0;
++	for (int i = 0; i < as->pt_used; ++i)
++		if (as->pt_pa[i] == tbl) { tva = as->pt_va[i]; break; }
++	((volatile uint64_t *)tva)[(pa >> 12) & 0x1ff] =
++	    (pa & ~0xfffull) | PTE_ACCESS | PTE_SHARE_INNER |
++	    PTE_ACCESS_RW | PTE_MEMATTR(0) | PTE_TABLE;
++	return 0;
++}
++
++/* program the AS registers (TRANSCFG/TRANSTAB/MEMATTR + UPDATE) */
++static int
++sgpu_as_bind(int nr, uint64_t l0_pa)
++{
++	uint32_t r = 0x2400u + (uint32_t)nr * 0x40u;
++	uint64_t cfg = AS_CFG_AARCH64_4K | AS_CFG_PTW_MEMATTR_WB |
++	    AS_CFG_R_ALLOCATE;
++	gwr(g_mali, r + AS_TRANSCFG_LO, (uint32_t)cfg);
++	gwr(g_mali, r + AS_TRANSCFG_HI, (uint32_t)(cfg >> 32));
++	gwr(g_mali, r + AS_TRANSTAB_LO, (uint32_t)(l0_pa & ~0xfull));
++	gwr(g_mali, r + AS_TRANSTAB_HI, (uint32_t)(l0_pa >> 32));
++	gwr(g_mali, r + AS_MEMATTR_LO, (uint32_t)MEMATTR_DEFAULT);
++	gwr(g_mali, r + AS_MEMATTR_HI, (uint32_t)(MEMATTR_DEFAULT >> 32));
++	gwr(g_mali, r + AS_COMMAND, AS_CMD_UPDATE);
++	return mwait(g_mali, r + AS_STATUS, AS_STATUS_ACTIVE, 0, 10000);
++}
++
++static void
++sgpu_as_unbind(int nr)
++{
++	uint32_t r = 0x2400u + (uint32_t)nr * 0x40u;
++	gwr(g_mali, r + AS_TRANSCFG_LO, AS_CFG_UNMAPPED);
++	gwr(g_mali, r + AS_TRANSCFG_HI, 0);
++	gwr(g_mali, r + AS_TRANSTAB_LO, 0);
++	gwr(g_mali, r + AS_TRANSTAB_HI, 0);
++	gwr(g_mali, r + AS_COMMAND, AS_CMD_UPDATE);
++	(void)mwait(g_mali, r + AS_STATUS, AS_STATUS_ACTIVE, 0, 10000);
++}
++
++static void
++sgpu_as_release(struct sgpu_as *as)
++{
++	for (int i = 0; i < SGPU_BO_MAX; ++i) {
++		if (as->bo[i].used) {
++			kmem_free(kernel_map, as->bo[i].va,
++			    as->bo[i].npages * 0x1000ull);
++			as->bo[i].used = 0;
++		}
++	}
++	sgpu_as_unbind(as->nr);
++	for (int i = 0; i < as->pt_used; ++i)
++		kmem_free(kernel_map, as->pt_va[i], 0x1000);
++	bzero(as, sizeof(*as));
++}
++
++/* ---- devfs entry points -------------------------------------------- */
++
++static int
++sgpu_open(dev_t dev, int flags, int devtype, proc_t p)
++{
++	struct sgpu_as *as = NULL;
++	(void)dev; (void)flags; (void)devtype; (void)p;
++	if (!g_dev_up)
++		return ENXIO;
++	lck_mtx_lock(&sgpu_dev_lock);
++	for (int i = 1; i < SGPU_AS_MAX; ++i) {
++		if (!g_as_table[i].used &&
++		    (grd(g_mali, MALI_AS_PRESENT) & (1u << i))) {
++			as = &g_as_table[i];
++			as->used = 1;
++			as->nr = (uint8_t)i;
++			break;
++		}
++	}
++	if (!as || sgpu_pt_new(as) != 0) {
++		if (as)
++			as->used = 0;
++		lck_mtx_unlock(&sgpu_dev_lock);
++		return ENOMEM;
++	}
++	if (sgpu_as_bind(as->nr, as->pt_pa[0])) {
++		sgpu_as_release(as);
++		lck_mtx_unlock(&sgpu_dev_lock);
++		return EIO;
++	}
++	devfs_set_cdevpriv(as);
++	lck_mtx_unlock(&sgpu_dev_lock);
++	LOG("fd open: as%d\n", as->nr);
++	return 0;
++}
++
++static int
++sgpu_close(dev_t dev, int flags, int devtype, proc_t p)
++{
++	struct sgpu_as *as = NULL;
++	(void)dev; (void)flags; (void)devtype; (void)p;
++	if (devfs_get_cdevpriv((void **)&as) || !as)
++		return 0;
++	lck_mtx_lock(&sgpu_dev_lock);
++	sgpu_as_release(as);
++	lck_mtx_unlock(&sgpu_dev_lock);
++	return 0;
++}
++
++static int
++sgpu_ioctl(dev_t dev, u_long cmd, caddr_t data, int fflag, proc_t p)
++{
++	struct sgpu_as *as = NULL;
++	int err = 0;
++	(void)dev; (void)fflag; (void)p;
++	if (!g_dev_up)
++		return ENXIO;
++	switch (cmd) {
++	case SGPU_IOC_INFO: {
++		struct sgpu_info *i = (struct sgpu_info *)data;
++		i->gpu_id = grd(g_mali, MALI_GPU_ID);
++		i->as_present = grd(g_mali, MALI_AS_PRESENT);
++		i->js_present = grd(g_mali, MALI_JS_PRESENT);
++		i->sh_present = grd(g_mali, MALI_SH_PRESENT_LO);
++		return 0;
++	}
++	}
++	if (devfs_get_cdevpriv((void **)&as) || !as)
++		return EBADF;
++	lck_mtx_lock(&sgpu_dev_lock);
++	switch (cmd) {
++	case SGPU_IOC_ALLOC: {
++		struct sgpu_alloc *a = (struct sgpu_alloc *)data;
++		struct sgpu_bo *bo = NULL;
++		vm_offset_t va;
++		if (!a->npages || a->npages > 4096) { err = EINVAL; break; }
++		for (int i = 0; i < SGPU_BO_MAX; ++i)
++			if (!as->bo[i].used) { bo = &as->bo[i]; break; }
++		if (!bo) { err = ENOSPC; break; }
++		if (kmem_alloc_contig(kernel_map, &va,
++		    (vm_size_t)a->npages << 12, PAGE_MASK, 0, 0,
++		    KMA_DATA | KMA_ZERO, VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++			err = ENOMEM;
++			break;
++		}
++		ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)va);
++		if (!pn) { kmem_free(kernel_map, va, (vm_size_t)a->npages << 12);
++			err = ENOMEM; break; }
++		bo->va = va;
++		bo->pa = ptoa_64(pn);
++		bo->npages = a->npages;
++		for (uint32_t i = 0; i < a->npages; ++i)
++			if (sgpu_map_page(as, bo->pa + (uint64_t)i * 0x1000)) {
++				kmem_free(kernel_map, va, (vm_size_t)a->npages << 12);
++				err = ENOMEM;
++				break;
++			}
++		if (err)
++			break;
++		bo->used = 1;
++		/* tables must be in DRAM before the AS walks them */
++		flush_dcache64(as->pt_pa[0],
++		    (unsigned)(as->pt_used * 0x1000), TRUE);
++		flush_dcache64(bo->pa, a->npages << 12, TRUE);
++		a->gva = bo->pa;
++		a->handle = (uint64_t)(uintptr_t)bo;
++		break;
++	}
++	case SGPU_IOC_FREE: {
++		struct sgpu_free *f = (struct sgpu_free *)data;
++		struct sgpu_bo *bo = NULL;
++		for (int i = 0; i < SGPU_BO_MAX; ++i)
++			if (as->bo[i].used && (uint64_t)(uintptr_t)&as->bo[i]
++			    == f->handle) { bo = &as->bo[i]; break; }
++		if (!bo) { err = EINVAL; break; }
++		kmem_free(kernel_map, bo->va, bo->npages * 0x1000ull);
++		bzero(bo, sizeof(*bo));
++		break;
++	}
++	case SGPU_IOC_SUBMIT: {
++		struct sgpu_submit *s = (struct sgpu_submit *)data;
++		uint32_t asr;
++		int owned = 0, done = 0;
++		if (!(grd(g_mali, MALI_JS_PRESENT) & (1u << s->js)) ||
++		    s->js >= SGPU_AS_MAX) { err = EINVAL; break; }
++		for (int i = 0; i < SGPU_BO_MAX && !owned; ++i)
++			if (as->bo[i].used && s->jc >= as->bo[i].pa &&
++			    s->jc < as->bo[i].pa +
++			    ((uint64_t)as->bo[i].npages << 12))
++				owned = 1;
++		if (!owned) { err = EFAULT; break; }
++		asr = 0x1800u + s->js * 0x80u;
++		gwr(g_mali, asr + JS_AFFINITY_NEXT_LO,
++		    grd(g_mali, MALI_SH_PRESENT_LO));
++		gwr(g_mali, asr + JS_AFFINITY_NEXT_HI, 0);
++		gwr(g_mali, asr + JS_HEAD_NEXT_LO, (uint32_t)s->jc);
++		gwr(g_mali, asr + JS_HEAD_NEXT_HI, (uint32_t)(s->jc >> 32));
++		gwr(g_mali, asr + JS_CONFIG_NEXT,
++		    (uint32_t)as->nr | s->cfg |
++		    JSC_START_FLUSH_CI | JSC_END_FLUSH_CI | JSC_THREAD_PRI(8));
++		gwr(g_mali, asr + JS_COMMAND_NEXT, JSC_START);
++		for (uint32_t i = 0, n = s->timeout_ms ? s->timeout_ms * 1000 :
++		    100000; i < n; ++i) {
++			if (grd(g_mali, JOB_IRQ_RAWSTAT) &
++			    ((1u << s->js) | (1u << (16 + s->js)))) {
++				done = 1;
++				break;
++			}
++			delay(1);
++		}
++		s->done = done;
++		s->status = grd(g_mali, asr + JS_STATUS);
++		gwr(g_mali, JOB_IRQ_CLEAR, (1u << s->js) | (1u << (16 + s->js)));
++		asr = 0x2400u + (uint32_t)as->nr * 0x40u;
++		s->fault_st = grd(g_mali, asr + AS_FAULTSTATUS);
++		s->fault_va = ((uint64_t)grd(g_mali, asr + AS_FAULTADDR_HI) << 32) |
++		    grd(g_mali, asr + AS_FAULTADDR_LO);
++		if (!done)
++			LOG("submit timeout as%d js%u jc=%#llx\n",
++			    as->nr, s->js, s->jc);
++		break;
++	}
++	case SGPU_IOC_FAULTDUMP:
++		gpu_as0_fault_dump();
++		break;
++	default:
++		err = ENOTTY;
++		break;
++	}
++	lck_mtx_unlock(&sgpu_dev_lock);
++	return err;
++}
++
++static const struct cdevsw sgpu_cdevsw = {
++	.d_open     = sgpu_open,
++	.d_close    = sgpu_close,
++	.d_ioctl    = sgpu_ioctl,
++	.d_stop     = eno_stop,
++	.d_reset    = eno_reset,
++	.d_select   = eno_select,
++	.d_mmap     = eno_mmap,
++	.d_strategy = eno_strat,
++	.d_type     = D_DISK,
++};
++
++void
++sweet_gpu_devfs_register(void)
++{
++	if (g_dev_up)
++		return;
++	g_cdev_major = cdevsw_add(-1, &sgpu_cdevsw);
++	if (g_cdev_major < 0) {
++		LOG("cdevsw_add failed %d\n", g_cdev_major);
++		return;
++	}
++	if (!devfs_make_node(makedev(g_cdev_major, 0), DEVFS_CHAR,
++	    UID_ROOT, GID_WHEEL, 0600, "sweetgpu")) {
++		LOG("devfs_make_node failed\n");
++		return;
++	}
++	g_dev_up = 1;
++	LOG("/dev/sweetgpu up (M3): per-fd AS, alloc/map/submit ready\n");
++}
+ #endif /* ARM64_BOARD_CONFIG_SWEET */

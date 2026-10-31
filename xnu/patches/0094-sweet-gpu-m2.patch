@@ -1,0 +1,1275 @@
+--- a/bsd/dev/sweet_gpu.c
++++ b/bsd/dev/sweet_gpu.c
+@@ -1,261 +1,957 @@
+-/*
+- * SWEET Mali-G57 (MT6853) milestone M1: power the MFG domains, ungate the
+- * mfgcfg clock and read GPU_ID.  Every register/sequence below is from
+- * vendor clk-mt6853-pg.c (spm_mtcmos_ctrl_mfg*) or the kbase r32p1 regmap
+- * documented in GPU-BRINGUP.md -- nothing here is guessed.
+- *
+- *   SPM (0x10006000):  PWR_STATUS=0x16c, PWR_STATUS_2ND=0x170
+- *   PWR_CON: MFG0=0x308 MFG1=0x30c MFG2=0x310 MFG3=0x314 MFG5=0x31c
+- *   PWR_CON bits: RST_B=b0 ISO=b1 ON=b2 ON_2ND=b3 CLK_DIS=b4 SRAM_PDN=b8
+- *                 SRAM_PDN_ACK=b12
+- *   sta_mask:        MFG0=b2 MFG1=b3 MFG2=b4 MFG3=b5 MFG5=b7
+- *   infracfg_ao (0x10001000): PROTECTEN_CLR=0x2a4, _1=0x2ac, _2=0x718
+- *   infracfg_pdn (0x10215000): MFG1_WAY_EN=0x4c (b11|b12)
+- *   MFG1 release order (vendor): sram_pdn=0 -> way_en=0x1800 ->
+- *     PROTECTEN_CLR=0x600000 -> PROTECTEN_2_CLR=0x80 ->
+- *     PROTECTEN_1_CLR=0x200000 -> PROTECTEN_2_CLR=0x60
+- *   mfgcfg (0x13FBF000): BG3D CG sta/set/clr = 0x0/0x4/0x8, bit0 (en = write1->clr)
+- *   mali (0x13000000, kbase r32p1 JM regmap):
+- *     GPU_ID 0x000 AS_PRESENT 0x018 JS_PRESENT 0x01c
+- *     GPU_IRQ_RAWSTAT 0x020 GPU_COMMAND 0x030 GPU_STATUS 0x034
+- *     SHADER_PRESENT_LO 0x100 _READY_LO 0x140 _PWRON_LO 0x180
+- *     TILER: 0x110/0x150/0x190  L2: 0x120/0x160/0x1a0
+- *     GPU_COMMAND: SOFT_RESET=1; IRQ RESET_COMPLETED=b8
+- *
+- * iOS-side reality check (see NOTES.md): iOS GPU services are AGX-only, so
+- * this can never produce Metal/Quartz acceleration on its own.  M1 only
+- * proves the silicon responds; everything is behind sweetgpu=1 (default off)
+- * because an untested MTCMOS sequence could wedge the boot.
+- */
+-#if defined(ARM64_BOARD_CONFIG_SWEET)
+-#include <sys/param.h>
+-#include <sys/systm.h>
+-#include <kern/clock.h>
+-#include <kern/thread.h>
+-#include <kern/sched_prim.h>
+-#include <machine/machine_routines.h>
+-#include <pexpert/pexpert.h>
+-
+-extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+-extern kern_return_t thread_terminate(thread_t);
+-void sweet_gpu_init(void);
+-
+-#define GPU_SPM_PA       0x10006000u
+-#define GPU_INFRA_PA     0x10001000u
+-#define GPU_IPDN_PA      0x10215000u /* infracfg_pdn */
+-#define GPU_MFGCFG_PA    0x13FBF000u
+-#define GPU_MALI_PA      0x13000000u
+-
+-/* SPM */
+-#define SP_PWR_STATUS    0x016cu
+-#define SP_PWR_STATUS_2  0x0170u
+-#define SP_MFG0_CON      0x0308u
+-#define SP_MFG1_CON      0x030cu
+-#define SP_MFG2_CON      0x0310u
+-#define SP_MFG3_CON      0x0314u
+-#define SP_MFG5_CON      0x031cu
+-/* PWR_CON bits (vendor) */
+-#define PWC_RST_B        (1u << 0)
+-#define PWC_ISO          (1u << 1)
+-#define PWC_ON           (1u << 2)
+-#define PWC_ON_2ND       (1u << 3)
+-#define PWC_CLK_DIS      (1u << 4)
+-#define PWC_SRAM_PDN     (1u << 8)
+-#define PWC_SRAM_ACK     (1u << 12)
+-/* PWR_STATUS bits */
+-#define STA_MFG0         (1u << 2)
+-#define STA_MFG1         (1u << 3)
+-#define STA_MFG2         (1u << 4)
+-#define STA_MFG3         (1u << 5)
+-#define STA_MFG5         (1u << 7)
+-/* bus-protect */
+-#define PROTEN_CLR       0x02a4u
+-#define PROTEN_1_CLR     0x02acu
+-#define PROTEN_2_CLR     0x0718u
+-#define IPDN_MFG1_WAY_EN 0x004cu
+-/* mfgcfg */
+-#define MFGCG_STA        0x00u
+-#define MFGCG_SET        0x04u
+-#define MFGCG_CLR        0x08u
+-#define MFGCG_ASYNC      0x20u
+-#define MFGCG_ASYNC_1    0x24u
+-#define MFGCG_GLOBAL     0xb0u
+-#define MFGCG_QCHANNEL   0xb4u
+-/* mali JM regmap (kbase r32p1) */
+-#define MALI_GPU_ID        0x000u
+-#define MALI_L2_FEATURES   0x004u
+-#define MALI_CORE_FEATURES 0x008u
+-#define MALI_MMU_FEATURES  0x014u
+-#define MALI_AS_PRESENT    0x018u
+-#define MALI_JS_PRESENT    0x01cu
+-#define MALI_IRQ_RAWSTAT   0x020u
+-#define MALI_IRQ_CLEAR     0x024u
+-#define MALI_COMMAND       0x030u
+-#define MALI_STATUS        0x034u
+-#define MALI_SH_PRESENT_LO 0x100u
+-#define MALI_TI_PRESENT_LO 0x110u
+-#define MALI_L2_PRESENT_LO 0x120u
+-#define MALI_SH_READY_LO   0x140u
+-#define MALI_L2_READY_LO   0x160u
+-#define MALI_SH_PWRON_LO   0x180u
+-#define MALI_L2_PWRON_LO   0x1a0u
+-#define CMD_SOFT_RESET     1u
+-#define IRQ_RESET_DONE     (1u << 8)
+-
+-static vm_offset_t g_spm, g_infra, g_ipdn, g_mfgcfg, g_mali;
+-
+-static uint32_t
+-grd(vm_offset_t base, uint32_t off)
+-{
+-	uint32_t v = *(volatile uint32_t *)(base + off);
+-	__asm__ volatile("dmb oshld" ::: "memory");
+-	return v;
+-}
+-
+-static void
+-gwr(vm_offset_t base, uint32_t off, uint32_t v)
+-{
+-	*(volatile uint32_t *)(base + off) = v;
+-	__asm__ volatile("dsb sy" ::: "memory");
+-}
+-
+-static int
+-gpoll_sta(uint32_t mask, int on)
+-{
+-	for (int i = 0; i < 20000; ++i) {
+-		if ((grd(g_spm, SP_PWR_STATUS) & mask) == (on ? mask : 0) &&
+-		    (grd(g_spm, SP_PWR_STATUS_2) & mask) == (on ? mask : 0))
+-			return 0;
+-		delay(1);
+-	}
+-	return -1;
+-}
+-
+-/* vendor power-on: ON|ON_2ND -> wait both status -> ~CLK_DIS -> ~ISO -> RST_B */
+-static int
+-mfg_pwr_on(uint32_t con, uint32_t sta, const char *name)
+-{
+-	gwr(g_spm, con, grd(g_spm, con) | PWC_ON);
+-	gwr(g_spm, con, grd(g_spm, con) | PWC_ON_2ND);
+-	if (gpoll_sta(sta, 1)) {
+-		printf("SWEET GPU: %s power-on timeout con=%#x sta=%#x/%#x\n",
+-		    name, grd(g_spm, con), grd(g_spm, SP_PWR_STATUS),
+-		    grd(g_spm, SP_PWR_STATUS_2));
+-		return -1;
+-	}
+-	gwr(g_spm, con, grd(g_spm, con) & ~PWC_CLK_DIS);
+-	gwr(g_spm, con, grd(g_spm, con) & ~PWC_ISO);
+-	gwr(g_spm, con, grd(g_spm, con) | PWC_RST_B);
+-	printf("SWEET GPU: %s domain on\n", name);
+-	return 0;
+-}
+-
+-/* vendor MFG1 bus-protect release (spm_mtcmos_ctrl_mfg1_bus_prot) */
+-static void
+-mfg1_bus_release(void)
+-{
+-	gwr(g_spm, SP_MFG1_CON, grd(g_spm, SP_MFG1_CON) & ~PWC_SRAM_PDN);
+-	for (int i = 0; i < 20000 && (grd(g_spm, SP_MFG1_CON) & PWC_SRAM_ACK); ++i)
+-		delay(1);
+-	gwr(g_ipdn, IPDN_MFG1_WAY_EN, 0x1800u);           /* way_en on, b11|b12 */
+-	for (int i = 0; i < 20000 && (grd(g_ipdn, IPDN_MFG1_WAY_EN) & 0x1800u) != 0x1800u; ++i)
+-		delay(1);
+-	gwr(g_infra, PROTEN_CLR,   0x00600000u);          /* STEP2_0: b21|b22 */
+-	gwr(g_infra, PROTEN_2_CLR, 0x00000080u);          /* STEP2_1: b7      */
+-	gwr(g_infra, PROTEN_1_CLR, 0x00200000u);          /* STEP1_0: b21     */
+-	gwr(g_infra, PROTEN_2_CLR, 0x00000060u);          /* STEP1_1: b5|b6   */
+-	printf("SWEET GPU: mfg1 bus prot released\n");
+-}
+-
+-static void
+-gpu_thread(void *arg, wait_result_t result)
+-{
+-	(void)arg;
+-	(void)result;
+-
+-	if (mfg_pwr_on(SP_MFG0_CON, STA_MFG0, "mfg0"))
+-		goto out;
+-	mfg_pwr_on(SP_MFG1_CON, STA_MFG1, "mfg1");
+-	mfg_pwr_on(SP_MFG2_CON, STA_MFG2, "mfg2");
+-	mfg_pwr_on(SP_MFG3_CON, STA_MFG3, "mfg3");
+-	mfg_pwr_on(SP_MFG5_CON, STA_MFG5, "mfg5");
+-	mfg1_bus_release();
+-
+-	/* ungate BG3D then apply the vendor external-CG sequence */
+-	gwr(g_mfgcfg, MFGCG_CLR, 1);                        /* bg3d gate bit0 */
+-	gwr(g_mfgcfg, MFGCG_ASYNC, grd(g_mfgcfg, MFGCG_ASYNC) | (0xfu << 22));
+-	gwr(g_mfgcfg, MFGCG_GLOBAL, grd(g_mfgcfg, MFGCG_GLOBAL) & ~(0x3u << 9));
+-	gwr(g_mfgcfg, MFGCG_QCHANNEL, grd(g_mfgcfg, MFGCG_QCHANNEL) | (1u << 4));
+-	gwr(g_mfgcfg, MFGCG_GLOBAL, grd(g_mfgcfg, MFGCG_GLOBAL) & ~((1u << 19) | (1u << 8)));
+-	gwr(g_mfgcfg, MFGCG_ASYNC_1, grd(g_mfgcfg, MFGCG_ASYNC_1) | 1u);
+-	printf("SWEET GPU: mfgcg sta=%#x global=%#x\n",
+-	    grd(g_mfgcfg, MFGCG_STA), grd(g_mfgcfg, MFGCG_GLOBAL));
+-
+-	uint32_t id = grd(g_mali, MALI_GPU_ID);
+-	printf("SWEET GPU: GPU_ID=%#08x AS=%#x JS=%#x L2f=%#x COREf=%#x MMUf=%#x\n",
+-	    id, grd(g_mali, MALI_AS_PRESENT), grd(g_mali, MALI_JS_PRESENT),
+-	    grd(g_mali, MALI_L2_FEATURES), grd(g_mali, MALI_CORE_FEATURES),
+-	    grd(g_mali, MALI_MMU_FEATURES));
+-	if (id == 0 || id == 0xffffffffu) {
+-		printf("SWEET GPU: no response at 0x13000000, stopping\n");
+-		goto out;
+-	}
+-
+-	/* kbase-style: soft reset, wait RESET_COMPLETED irq bit */
+-	gwr(g_mali, MALI_IRQ_CLEAR, IRQ_RESET_DONE);
+-	gwr(g_mali, MALI_COMMAND, CMD_SOFT_RESET);
+-	for (int i = 0; i < 100000 &&
+-	    !(grd(g_mali, MALI_IRQ_RAWSTAT) & IRQ_RESET_DONE); ++i)
+-		delay(1);
+-	printf("SWEET GPU: soft reset done=%d status=%#x\n",
+-	    !!(grd(g_mali, MALI_IRQ_RAWSTAT) & IRQ_RESET_DONE),
+-	    grd(g_mali, MALI_STATUS));
+-
+-	/* power L2 + all shader cores, wait READY == PRESENT */
+-	uint32_t sh = grd(g_mali, MALI_SH_PRESENT_LO);
+-	uint32_t l2 = grd(g_mali, MALI_L2_PRESENT_LO);
+-	printf("SWEET GPU: present shader=%#x tiler=%#x l2=%#x\n",
+-	    sh, grd(g_mali, MALI_TI_PRESENT_LO), l2);
+-	gwr(g_mali, MALI_L2_PWRON_LO, l2);
+-	gwr(g_mali, MALI_SH_PWRON_LO, sh);
+-	for (int i = 0; i < 100000 &&
+-	    (grd(g_mali, MALI_L2_READY_LO) != l2 ||
+-	     grd(g_mali, MALI_SH_READY_LO) != sh); ++i)
+-		delay(1);
+-	printf("SWEET GPU: ready l2=%#x sh=%#x\n",
+-	    grd(g_mali, MALI_L2_READY_LO), grd(g_mali, MALI_SH_READY_LO));
+-out:
+-	(void)thread_terminate(current_thread());
+-	thread_block(THREAD_CONTINUE_NULL);
+-}
+-
+-void
+-sweet_gpu_init(void)
+-{
+-	static int started;
+-	int enabled = 0; /* off unless sweetgpu=1: untested MTCMOS may wedge */
+-	thread_t thread;
+-	if (started)
+-		return;
+-	started = 1;
+-	(void)PE_parse_boot_argn("sweetgpu", &enabled, sizeof(enabled));
+-	if (!enabled) {
+-		printf("SWEET GPU: off (sweetgpu=1 to probe Mali-G57 M1)\n");
+-		return;
+-	}
+-	g_spm = ml_io_map(GPU_SPM_PA, 0x1000);
+-	g_infra = ml_io_map(GPU_INFRA_PA, 0x1000);
+-	g_ipdn = ml_io_map(GPU_IPDN_PA, 0x1000);
+-	g_mfgcfg = ml_io_map(GPU_MFGCFG_PA, 0x1000);
+-	g_mali = ml_io_map(GPU_MALI_PA, 0x1000);
+-	if (!g_spm || !g_infra || !g_ipdn || !g_mfgcfg || !g_mali) {
+-		printf("SWEET GPU: MMIO map failed\n");
+-		return;
+-	}
+-	kern_return_t kr = kernel_thread_start(gpu_thread, NULL, &thread);
+-	if (kr == KERN_SUCCESS)
+-		thread_deallocate(thread);
+-	else
+-		printf("SWEET GPU: kernel_thread_start failed %d\n", kr);
+-}
+-#endif /* ARM64_BOARD_CONFIG_SWEET */
++/*
++ * SWEET Mali-G57 (MT6853 / Dimensity 800U, RMX2117) GPU driver -- M1 + M2.
++ *
++ * Brings the Mali block up from cold, runs a real job-submission
++ * self-test, then powers it back down:
++ *
++ *   1. PMIC rails   VSRAM_MD (0.75 V) then VPROC1/VGPU (0.65 V) over pwrap
++ *                   SWINF_2, serialised with sweet_keys on sweet_pwrap_lock.
++ *                   Rails already on are left untouched (and not disabled
++ *                   on teardown).
++ *   2. MTCMOS       MFG0 -> MFG1 -> MFG2/MFG3/MFG5 with the vendor
++ *                   clk-mt6853-pg.c sequence, incl. MFG1 bus-protect
++ *                   release.  Every wait is bounded; failures roll back.
++ *   3. Clock gates  mfgcfg subsys-bg3d gate + mt_gpufreq_external_cg_control
++ *                   sequence (GPU stays on mfg_ref 26 MHz -- no PLL touch).
++ *   4. Mali init    GPU_ID sanity, soft reset, L2/tiler/shader power-on
++ *                   with READY==PRESENT checks.
++ *   5. M2 selftest  GPU MMU AS0 programmed with a kbase-r25p0-layout
++ *                   aarch64 4K page table, then one WRITE_VALUE job on JS0;
++ *                   the 64-bit value it writes is verified in DRAM.  This is
++ *                   the end-to-end proof that power, clocks, translation
++ *                   and job execution all work.
++ *   6. Teardown     exact vendor reverse: cores off, AS0 unmapped, bus-idle
++ *                   check, re-gate BG3D, MFG off, rails restored.
++ *                   sweetgpu_keep=1 skips 6 and leaves the block live.
++ *
++ * Sources (nothing guessed): vendor kernel clk-mt6853-pg.c,
++ * mtk_gpufreq_plat.c, mtk-pmic-wrap.c, include/linux/mfd/mt6359p/
++ * registers.h, kbase mali-r25p0 regmap + mmu/jm backends, Mesa panfrost
++ * genxml v9 job descriptors.
++ *
++ * iOS GPU services are AGX-only, so this can never produce Metal/Quartz
++ * acceleration on its own; it is the checked hardware layer a future
++ * kbase-equivalent and an IOGPU-shaped service can sit on.
++ *
++ * Off by default: boot-arg sweetgpu=1.  Also honoured:
++ *   sweetgpu_keep=1  leave GPU powered + AS0 mapped after the test
++ *   sweetgpu_nojob=1 stop after core power-on (skip MMU/job)
++ */
++#if defined(ARM64_BOARD_CONFIG_SWEET)
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <kern/clock.h>
++#include <kern/thread.h>
++#include <kern/sched_prim.h>
++#include <machine/machine_routines.h>
++#include <arm/caches_internal.h>
++#include <vm/pmap.h>
++#include <vm/vm_kern.h>
++#include <pexpert/pexpert.h>
++
++extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
++extern ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va);
++extern kern_return_t kernel_thread_start(thread_continue_t, void *, thread_t *);
++extern void thread_deallocate(thread_t);
++extern void sweet_pwrap_lock(void);
++extern void sweet_pwrap_unlock(void);
++void sweet_gpu_init(void);
++
++/* ---------------- MMIO bases ---------------- */
++#define GPU_PWRAP_PA    0x10026000u /* pwrap (PMIF SPI arbiter) */
++#define GPU_SPM_PA      0x10006000u /* scpsys */
++#define GPU_INFRA_PA    0x10001000u /* infracfg_ao */
++#define GPU_IPDN_PA     0x10215000u /* infracfg_pdn */
++#define GPU_MFGCFG_PA   0x13FBF000u /* mfgcfg */
++#define GPU_MALI_PA     0x13000000u /* Mali-G57, 0x4000 bytes */
++
++/* ---------------- pwrap SWINF_2 (mt6853_regs, ARB_V3) ---------------- */
++#define PW_ACC          0xC80u
++#define PW_WDATA        0xC84u
++#define PW_RDATA        0xC94u
++#define PW_VLD_CLR      0xCA4u
++#define PW_STA          0xCA8u
++#define PW_FSM(x)       (((x) >> 1) & 0x7u)
++#define PW_FSM_IDLE     0x0u
++#define PW_FSM_WFVLDCLR 0x6u
++
++/* MT6359P (include/linux/mfd/mt6359p/registers.h) */
++#define PM_HWCID        0x0008u
++#define PM_SWCID        0x000au
++/* VPROC1 = VGPU buck: uV = 400000 + 6250*sel (sel[6:0]) */
++#define PM_VGPU_EN      0x1708u /* CON0 b0 */
++#define PM_VGPU_EN_SET  0x170au
++#define PM_VGPU_EN_CLR  0x170cu
++#define PM_VGPU_VOSEL   0x172eu /* ELR0 [6:0] */
++#define PM_VGPU_DA_VOSEL 0x1726u /* DBG0 [6:0] */
++#define PM_VGPU_DA_EN   0x1728u /* DBG1 b0 */
++/* VSRAM_MD = VSRAM_GPU ldo: uV = 500000 + 6250*sel */
++#define PM_VSRAM_EN     0x1f2eu /* CON0 b0 */
++#define PM_VSRAM_VOSEL  0x1b4au /* ELR  [6:0] */
++#define PM_VSRAM_DA_EN  0x1f32u /* MON  b0 */
++#define PM_VSRAM_DA_VOSEL 0x1f36u /* VOSEL1 [14:8] */
++/* M1 plan voltages: sel 40 -> VGPU 0.650 V, VSRAM 0.750 V (within the
++ * vendor -100..+300 mV VSRAM-VGPU constraint). */
++#define PM_SEL_M1       40u
++
++/* ---------------- SPM / MTCMOS (clk-mt6853-pg.c) ---------------- */
++#define SP_PWR_STATUS   0x016cu
++#define SP_PWR_STATUS_2 0x0170u
++#define SP_MFG0_CON     0x0308u
++#define SP_MFG1_CON     0x030cu
++#define SP_MFG2_CON     0x0310u
++#define SP_MFG3_CON     0x0314u
++#define SP_MFG5_CON     0x031cu
++#define PWC_RST_B       (1u << 0)
++#define PWC_ISO         (1u << 1)
++#define PWC_ON          (1u << 2)
++#define PWC_ON_2ND      (1u << 3)
++#define PWC_CLK_DIS     (1u << 4)
++#define PWC_SRAM_PDN    (1u << 8)
++#define PWC_SRAM_ACK    (1u << 12)
++#define STA_MFG0        (1u << 2)
++#define STA_MFG1        (1u << 3)
++#define STA_MFG2        (1u << 4)
++#define STA_MFG3        (1u << 5)
++#define STA_MFG5        (1u << 7)
++/* infracfg_ao bus-protect regs */
++#define PROTEN_STA1     0x0228u
++#define PROTEN_SET      0x02a0u
++#define PROTEN_CLR      0x02a4u
++#define PROTEN_STA1_1   0x0258u
++#define PROTEN_1_SET    0x02a8u
++#define PROTEN_1_CLR    0x02acu
++#define PROTEN_STA1_2   0x0724u
++#define PROTEN_2_SET    0x0714u
++#define PROTEN_2_CLR    0x0718u
++/* infracfg_pdn */
++#define IPDN_WAY_EN     0x004cu
++
++/* ---------------- mfgcfg clock gates (clk-mt6853-mfgcfg/gpufreq) -------- */
++#define MFGCG_STA       0x00u
++#define MFGCG_SET       0x04u
++#define MFGCG_CLR       0x08u
++#define MFGCG_ASYNC     0x20u
++#define MFGCG_ASYNC_1   0x24u
++#define MFGCG_GLOBAL    0xb0u
++#define MFGCG_QCHANNEL  0xb4u
++#define MFGCG_DBG_SEL   0x170u
++#define MFGCG_DBG_TOP   0x178u
++
++/* ---------------- Mali JM regmap (kbase r25p0) ---------------- */
++#define MALI_GPU_ID        0x000u
++#define MALI_L2_FEATURES   0x004u
++#define MALI_CORE_FEATURES 0x008u
++#define MALI_MMU_FEATURES  0x014u
++#define MALI_AS_PRESENT    0x018u
++#define MALI_JS_PRESENT    0x01cu
++#define MALI_IRQ_RAWSTAT   0x020u
++#define MALI_IRQ_CLEAR     0x024u
++#define MALI_COMMAND       0x030u
++#define MALI_STATUS        0x034u
++#define MALI_SH_PRESENT_LO 0x100u
++#define MALI_SH_PRESENT_HI 0x104u
++#define MALI_TI_PRESENT_LO 0x110u
++#define MALI_TI_PRESENT_HI 0x114u
++#define MALI_L2_PRESENT_LO 0x120u
++#define MALI_L2_PRESENT_HI 0x124u
++#define MALI_SH_READY_LO   0x140u
++#define MALI_SH_READY_HI   0x144u
++#define MALI_TI_READY_LO   0x150u
++#define MALI_TI_READY_HI   0x154u
++#define MALI_L2_READY_LO   0x160u
++#define MALI_L2_READY_HI   0x164u
++#define MALI_SH_PWRON_LO   0x180u
++#define MALI_SH_PWRON_HI   0x184u
++#define MALI_TI_PWRON_LO   0x190u
++#define MALI_TI_PWRON_HI   0x194u
++#define MALI_L2_PWRON_LO   0x1a0u
++#define MALI_L2_PWRON_HI   0x1a4u
++#define MALI_SH_PWROFF_LO  0x1c0u
++#define MALI_SH_PWROFF_HI  0x1c4u
++#define MALI_TI_PWROFF_LO  0x1d0u
++#define MALI_TI_PWROFF_HI  0x1d4u
++#define MALI_L2_PWROFF_LO  0x1e0u
++#define MALI_L2_PWROFF_HI  0x1e4u
++#define CMD_SOFT_RESET     1u
++#define IRQ_RESET_DONE     (1u << 8)
++/* JOB_CONTROL (base 0x1000) */
++#define JOB_IRQ_RAWSTAT    0x1000u /* slot n done = bit n, fail = bit 16+n */
++#define JOB_IRQ_CLEAR      0x1004u
++#define JOB_IRQ_MASK       0x1008u
++#define JS0                0x1800u /* JOB_SLOT0 = 0x1000 + 0x800 */
++#define JS_HEAD_LO         0x00u
++#define JS_HEAD_HI         0x04u
++#define JS_AFFINITY_NEXT_LO 0x50u
++#define JS_AFFINITY_NEXT_HI 0x54u
++#define JS_CONFIG_NEXT     0x58u
++#define JS_HEAD_NEXT_LO    0x40u
++#define JS_HEAD_NEXT_HI    0x44u
++#define JS_COMMAND_NEXT    0x60u
++#define JS_COMMAND         0x20u
++#define JS_STATUS          0x24u
++#define JSC_START          0x01u
++#define JSC_START_FLUSH_CI (3u << 8)
++#define JSC_END_FLUSH_CI   (3u << 12)
++#define JSC_THREAD_PRI(n)  ((n) << 16)
++/* MMU (base 0x2000): AS n regs at 0x400 + n*0x40 */
++#define MMU_IRQ_RAWSTAT    0x2000u
++#define MMU_IRQ_CLEAR      0x2004u
++#define MMU_IRQ_MASK       0x2008u
++#define AS0                0x2400u
++#define AS_TRANSTAB_LO     0x00u
++#define AS_TRANSTAB_HI     0x04u
++#define AS_MEMATTR_LO      0x08u
++#define AS_MEMATTR_HI      0x0cu
++#define AS_COMMAND         0x18u
++#define AS_FAULTSTATUS     0x1cu
++#define AS_FAULTADDR_LO    0x20u
++#define AS_FAULTADDR_HI    0x24u
++#define AS_STATUS          0x28u
++#define AS_TRANSCFG_LO     0x30u
++#define AS_TRANSCFG_HI     0x34u
++#define AS_FAULTEXTRA_LO   0x38u
++#define AS_FAULTEXTRA_HI   0x3cu
++#define AS_CMD_UPDATE      0x01u
++#define AS_CMD_FLUSH_MEM   0x05u
++#define AS_STATUS_ACTIVE   0x01u
++#define AS_CFG_UNMAPPED    0x01u
++#define AS_CFG_AARCH64_4K  0x06u
++#define AS_CFG_PTW_MEMATTR_WB (2u << 24)
++#define AS_CFG_R_ALLOCATE  (1u << 30)
++#define MMU_PF(as)         (1u << (as))
++#define MMU_BUS_ERR(as)    (1u << ((as) + 16))
++/* aarch64 4K page-table entries (kbase mmu_mode_aarch64) */
++#define PTE_TABLE          0x3ull
++#define PTE_ACCESS         (1ull << 10)
++#define PTE_MEMATTR(x)     ((uint64_t)(x) << 2)
++#define PTE_ACCESS_RW      (1ull << 6)
++#define PTE_SHARE_INNER    (3ull << 8)
++/* MEMATTR indices -> kbase default memattr word:
++ * 0:0x88 1:0x8f 2:0x8d 3:0x88 4:0x8d 5:0x4c */
++#define MEMATTR_DEFAULT    0x004c8d888d8f88ull
++
++/* ---------------- Valhall (v9 genxml) WRITE_VALUE job descriptor ------- */
++#define JH_TYPE_SHIFT      1u   /* dword4 bits[1:7] */
++#define JH_IS64B           1u   /* dword4 bit0 (dropped in v9: always 64b) */
++#define JT_WRITE_VALUE     0x02u
++#define JH_NEXT            0x18u
++#define WVP_ADDRESS        0x20u /* payload offset */
++#define WVP_TYPE           0x28u
++#define WVP_IMMEDIATE      0x30u
++#define WVT_IMMEDIATE64    0x07u
++#define WV_MAGIC           0x47505f4d325f4f4bull /* "GP_M2_OK" */
++#define WV_SENTINEL        0xbad0bad0bad0bad0ull
++
++/* ---------------- DMA arena layout (physically contiguous) ------------ */
++#define DMA_SIZE         0x10000u /* 64 KiB */
++#define PGD_PAGES        8        /* L0 + up to 7 sub-tables, 4 KiB each */
++#define OFF_DESC         0x8000u
++#define OFF_TARGET       0x9000u
++
++static vm_offset_t g_pwrap, g_spm, g_infra, g_ipdn, g_mfgcfg, g_mali;
++static vm_offset_t g_dma;
++static uint64_t g_dma_pa;
++static int g_keep, g_nojob;
++/* teardown bookkeeping */
++static int g_rail_vgpu, g_rail_vsram;      /* rails WE enabled */
++static int g_mfg_on[8];                    /* domains we powered */
++static int g_cores_on, g_as_mapped, g_cg_on, g_dma_used;
++
++#define LOG(...) printf("SWEET GPU: " __VA_ARGS__)
++
++static uint32_t
++grd(vm_offset_t base, uint32_t off)
++{
++	uint32_t v = *(volatile uint32_t *)(base + off);
++	__asm__ volatile("dmb oshld" ::: "memory");
++	return v;
++}
++
++static void
++gwr(vm_offset_t base, uint32_t off, uint32_t v)
++{
++	*(volatile uint32_t *)(base + off) = v;
++	__asm__ volatile("dsb sy" ::: "memory");
++}
++
++/* bounded poll: wait (reg & mask) == val; loops ~= microseconds */
++static int
++mwait(vm_offset_t base, uint32_t off, uint32_t mask, uint32_t val, int loops)
++{
++	for (int i = 0; i < loops; ++i) {
++		if ((grd(base, off) & mask) == val)
++			return 0;
++		delay(1);
++	}
++	return -1;
++}
++
++/* ---------------- pwrap (SWINF_2, shared lock) ---------------- */
++
++static int
++pw_wait(uint32_t want)
++{
++	for (int i = 0; i < 1000; ++i) {
++		if (PW_FSM(grd(g_pwrap, PW_STA)) == want)
++			return 0;
++		delay(1);
++	}
++	return -1;
++}
++
++static int
++pmic_read16(uint32_t adr, uint32_t *out)
++{
++	int rc;
++	sweet_pwrap_lock();
++	if (pw_wait(PW_FSM_IDLE)) {
++		if (PW_FSM(grd(g_pwrap, PW_STA)) == PW_FSM_WFVLDCLR)
++			gwr(g_pwrap, PW_VLD_CLR, 1);
++		sweet_pwrap_unlock();
++		return -1;
++	}
++	gwr(g_pwrap, PW_ACC, adr);
++	rc = pw_wait(PW_FSM_WFVLDCLR);
++	if (!rc) {
++		*out = grd(g_pwrap, PW_RDATA) & 0xffffu;
++		gwr(g_pwrap, PW_VLD_CLR, 1);
++	}
++	sweet_pwrap_unlock();
++	return rc ? -2 : 0;
++}
++
++/* vendor write16: wait IDLE -> WDATA=data -> ACC=(1<<29)|adr */
++static int
++pmic_write16(uint32_t adr, uint32_t data)
++{
++	int rc;
++	sweet_pwrap_lock();
++	if (pw_wait(PW_FSM_IDLE)) {
++		if (PW_FSM(grd(g_pwrap, PW_STA)) == PW_FSM_WFVLDCLR)
++			gwr(g_pwrap, PW_VLD_CLR, 1);
++		sweet_pwrap_unlock();
++		return -1;
++	}
++	gwr(g_pwrap, PW_WDATA, data);
++	gwr(g_pwrap, PW_ACC, (1u << 29) | adr);
++	rc = pw_wait(PW_FSM_IDLE); /* let the write retire before next op */
++	sweet_pwrap_unlock();
++	return rc;
++}
++
++static int
++pmic_rmw16(uint32_t adr, uint32_t clr, uint32_t set)
++{
++	uint32_t v;
++	if (pmic_read16(adr, &v))
++		return -1;
++	return pmic_write16(adr, (v & ~clr) | set);
++}
++
++static int
++pmic_rail_on(const char *name, uint32_t en_set, uint32_t vsel, uint32_t sel,
++    uint32_t da_en, uint32_t da_vsel, uint32_t da_shift, int use_rmw_en)
++{
++	uint32_t en = 0, v = 0;
++	if (pmic_read16(da_en, &en))
++		return -1;
++	if (en & 1) {
++		LOG("%s rail already on, leaving it\n", name);
++		return 1; /* already on -> not ours to disable */
++	}
++	/* program voltage first, then enable */
++	if (pmic_rmw16(vsel, 0x7f, sel))
++		return -2;
++	if (use_rmw_en ? pmic_rmw16(en_set, 0, 1)
++	    : pmic_write16(en_set, 1))   /* CON0_SET: W1S */
++		return -3;
++	delay(2000); /* buck ramp + settle */
++	if (pmic_read16(da_en, &en) || !(en & 1)) {
++		LOG("%s enable failed da_en=%#x\n", name, en);
++		return -4;
++	}
++	if (pmic_read16(da_vsel, &v) || (((v >> da_shift) & 0x7f) != sel)) {
++		LOG("%s voltage mismatch da_vsel=%#x\n", name, v);
++		return -5;
++	}
++	LOG("%s on, sel=%u (verified)\n", name, sel);
++	return 2;
++}
++
++static int
++gpu_pmic_up(void)
++{
++	uint32_t hw = 0, sw = 0;
++	if (!g_pwrap || pmic_read16(PM_HWCID, &hw) || pmic_read16(PM_SWCID, &sw)) {
++		LOG("pwrap dead, cannot check GPU rails -- aborting\n");
++		return -1;
++	}
++	LOG("pmic hwcid=%#x swcid=%#x\n", hw, sw);
++	/* vendor order: VSRAM_GPU then VGPU */
++	int r = pmic_rail_on("vsram_md", PM_VSRAM_EN, PM_VSRAM_VOSEL, PM_SEL_M1,
++	    PM_VSRAM_DA_EN, PM_VSRAM_DA_VOSEL, 8, 1 /* RMW on CON0 */);
++	if (r < 0)
++		return r;
++	g_rail_vsram = (r == 2);
++	r = pmic_rail_on("vproc1", PM_VGPU_EN_SET, PM_VGPU_VOSEL, PM_SEL_M1,
++	    PM_VGPU_DA_EN, PM_VGPU_DA_VOSEL, 0, 0 /* SET reg */);
++	if (r < 0) {
++		if (g_rail_vsram)
++			(void)pmic_rmw16(PM_VSRAM_EN, 1, 0);
++		g_rail_vsram = 0;
++		return r;
++	}
++	g_rail_vgpu = (r == 2);
++	return 0;
++}
++
++static void
++gpu_pmic_down(void)
++{
++	/* reverse order, only rails we enabled */
++	if (g_rail_vgpu) {
++		(void)pmic_write16(PM_VGPU_EN_CLR, 1);
++		g_rail_vgpu = 0;
++	}
++	if (g_rail_vsram) {
++		(void)pmic_rmw16(PM_VSRAM_EN, 1, 0);
++		g_rail_vsram = 0;
++	}
++}
++
++/* ---------------- MTCMOS ---------------- */
++
++/* vendor power-on: ON|ON_2ND -> wait STA+STA2 -> ~CLK_DIS -> ~ISO -> RST_B */
++static int
++mfg_pwr_on(int idx, uint32_t con, uint32_t sta, const char *name)
++{
++	gwr(g_spm, con, grd(g_spm, con) | PWC_ON);
++	gwr(g_spm, con, grd(g_spm, con) | PWC_ON_2ND);
++	if (mwait(g_spm, SP_PWR_STATUS, sta, sta, 5000) ||
++	    mwait(g_spm, SP_PWR_STATUS_2, sta, sta, 5000)) {
++		LOG("%s power-on timeout con=%#x sta=%#x/%#x\n", name,
++		    grd(g_spm, con), grd(g_spm, SP_PWR_STATUS),
++		    grd(g_spm, SP_PWR_STATUS_2));
++		return -1;
++	}
++	gwr(g_spm, con, grd(g_spm, con) & ~PWC_CLK_DIS);
++	gwr(g_spm, con, grd(g_spm, con) & ~PWC_ISO);
++	gwr(g_spm, con, grd(g_spm, con) | PWC_RST_B);
++	g_mfg_on[idx] = 1;
++	LOG("%s on\n", name);
++	return 0;
++}
++
++/* vendor power-off: ISO=1 -> CLK_DIS=1 -> RST_B=0 -> ON=0 -> ON_2ND=0 -> wait */
++static void
++mfg_pwr_off(uint32_t con, uint32_t sta, const char *name)
++{
++	gwr(g_spm, con, grd(g_spm, con) | PWC_ISO);
++	gwr(g_spm, con, grd(g_spm, con) | PWC_CLK_DIS);
++	gwr(g_spm, con, grd(g_spm, con) & ~PWC_RST_B);
++	gwr(g_spm, con, grd(g_spm, con) & ~PWC_ON);
++	gwr(g_spm, con, grd(g_spm, con) & ~PWC_ON_2ND);
++	if (mwait(g_spm, SP_PWR_STATUS, sta, 0, 5000) ||
++	    mwait(g_spm, SP_PWR_STATUS_2, sta, 0, 5000))
++		LOG("%s power-off timeout sta=%#x/%#x\n", name,
++		    grd(g_spm, SP_PWR_STATUS), grd(g_spm, SP_PWR_STATUS_2));
++	else
++		LOG("%s off\n", name);
++}
++
++/* SRAM bus protect for simple domains: pdn!=0 -> set, else release */
++static int
++mfg_sram(uint32_t con, int pdn, const char *name)
++{
++	if (pdn)
++		gwr(g_spm, con, grd(g_spm, con) | PWC_SRAM_PDN);
++	else
++		gwr(g_spm, con, grd(g_spm, con) & ~PWC_SRAM_PDN);
++	if (mwait(g_spm, con, PWC_SRAM_ACK, pdn ? PWC_SRAM_ACK : 0, 5000)) {
++		LOG("%s sram_pdn=%d timeout con=%#x\n", name, pdn, grd(g_spm, con));
++		return -1;
++	}
++	return 0;
++}
++
++/* vendor MFG1 bus-protect release (spm_mtcmos_ctrl_mfg1_bus_prot ON) */
++static int
++mfg1_bus_release(void)
++{
++	if (mfg_sram(SP_MFG1_CON, 0, "mfg1"))
++		return -1;
++	gwr(g_ipdn, IPDN_WAY_EN, 0x1800u);              /* step0 way_en on */
++	if (mwait(g_ipdn, IPDN_WAY_EN, 0x1800u, 0x1800u, 5000)) {
++		LOG("mfg1 way_en timeout v=%#x\n", grd(g_ipdn, IPDN_WAY_EN));
++		return -2;
++	}
++	/* release acks are ignored by the vendor driver too */
++	gwr(g_infra, PROTEN_CLR,   0x00600000u);        /* step2_0 b21|b22 */
++	gwr(g_infra, PROTEN_2_CLR, 0x00000080u);        /* step2_1 b7      */
++	gwr(g_infra, PROTEN_1_CLR, 0x00200000u);        /* step1_0 b21     */
++	gwr(g_infra, PROTEN_2_CLR, 0x00000060u);        /* step1_1 b5|b6   */
++	LOG("mfg1 bus prot released\n");
++	return 0;
++}
++
++/* vendor MFG1 bus-protect set (spm_mtcmos_ctrl_mfg1_bus_prot DOWN), checked */
++static int
++mfg1_bus_protect(void)
++{
++	int rc = 0;
++	gwr(g_ipdn, IPDN_WAY_EN, 0x1000u);              /* step0 way_en off */
++	rc |= mwait(g_ipdn, IPDN_WAY_EN, 0x1000u, 0x1000u, 5000);
++	gwr(g_infra, PROTEN_1_SET, 0x00200000u);        /* step1_0 */
++	rc |= mwait(g_infra, PROTEN_STA1_1, 0x200000u, 0x200000u, 5000);
++	gwr(g_infra, PROTEN_2_SET, 0x00000060u);        /* step1_1 */
++	rc |= mwait(g_infra, PROTEN_STA1_2, 0x60u, 0x60u, 5000);
++	gwr(g_infra, PROTEN_SET,   0x00600000u);        /* step2_0 */
++	rc |= mwait(g_infra, PROTEN_STA1, 0x600000u, 0x600000u, 5000);
++	gwr(g_infra, PROTEN_2_SET, 0x00000080u);        /* step2_1 */
++	rc |= mwait(g_infra, PROTEN_STA1_2, 0x80u, 0x80u, 5000);
++	rc |= mfg_sram(SP_MFG1_CON, 1, "mfg1");
++	if (rc)
++		LOG("mfg1 bus protect timeout (way=%#x s1=%#x s1_1=%#x s1_2=%#x)\n",
++		    grd(g_ipdn, IPDN_WAY_EN), grd(g_infra, PROTEN_STA1),
++		    grd(g_infra, PROTEN_STA1_1), grd(g_infra, PROTEN_STA1_2));
++	return rc;
++}
++
++/* ---------------- mfgcfg clock gates ---------------- */
++
++static int
++gpu_cg_on(void)
++{
++	gwr(g_mfgcfg, MFGCG_CLR, 1);                        /* bg3d gate bit0 */
++	if (mwait(g_mfgcfg, MFGCG_STA, 1, 0, 5000)) {
++		LOG("bg3d ungate timeout sta=%#x\n", grd(g_mfgcfg, MFGCG_STA));
++		return -1;
++	}
++	/* vendor external-CG sequence */
++	gwr(g_mfgcfg, MFGCG_ASYNC, grd(g_mfgcfg, MFGCG_ASYNC) | (0xfu << 22));
++	gwr(g_mfgcfg, MFGCG_GLOBAL,
++	    grd(g_mfgcfg, MFGCG_GLOBAL) & ~(0x3u << 9));
++	gwr(g_mfgcfg, MFGCG_QCHANNEL,
++	    grd(g_mfgcfg, MFGCG_QCHANNEL) | (1u << 4));
++	gwr(g_mfgcfg, MFGCG_GLOBAL,
++	    grd(g_mfgcfg, MFGCG_GLOBAL) & ~((1u << 19) | (1u << 8)));
++	gwr(g_mfgcfg, MFGCG_ASYNC_1, grd(g_mfgcfg, MFGCG_ASYNC_1) | 1u);
++	g_cg_on = 1;
++	LOG("mfgcg on sta=%#x global=%#x\n",
++	    grd(g_mfgcfg, MFGCG_STA), grd(g_mfgcfg, MFGCG_GLOBAL));
++	return 0;
++}
++
++/* mt_gpufreq_check_bus_idle, bounded (vendor spins forever) */
++static void
++gpu_bus_idle(void)
++{
++	gwr(g_mfgcfg, MFGCG_QCHANNEL, 1);
++	gwr(g_mfgcfg, MFGCG_DBG_SEL, 3);
++	if (mwait(g_mfgcfg, MFGCG_DBG_TOP, 4, 4, 10000))
++		LOG("bus idle timeout dbg=%#x\n", grd(g_mfgcfg, MFGCG_DBG_TOP));
++}
++
++/* ---------------- Mali block ---------------- */
++
++static int
++mali_soft_reset(void)
++{
++	gwr(g_mali, MALI_IRQ_CLEAR, IRQ_RESET_DONE);
++	gwr(g_mali, MALI_COMMAND, CMD_SOFT_RESET);
++	if (mwait(g_mali, MALI_IRQ_RAWSTAT, IRQ_RESET_DONE, IRQ_RESET_DONE,
++	    100000)) {
++		LOG("soft reset timeout rawstat=%#x status=%#x\n",
++		    grd(g_mali, MALI_IRQ_RAWSTAT), grd(g_mali, MALI_STATUS));
++		return -1;
++	}
++	gwr(g_mali, MALI_IRQ_CLEAR, IRQ_RESET_DONE);
++	LOG("soft reset done status=%#x\n", grd(g_mali, MALI_STATUS));
++	return 0;
++}
++
++static int
++mali_cores_on(void)
++{
++	uint32_t shl = grd(g_mali, MALI_SH_PRESENT_LO);
++	uint32_t shh = grd(g_mali, MALI_SH_PRESENT_HI);
++	uint32_t til = grd(g_mali, MALI_TI_PRESENT_LO);
++	uint32_t tih = grd(g_mali, MALI_TI_PRESENT_HI);
++	uint32_t l2l = grd(g_mali, MALI_L2_PRESENT_LO);
++	uint32_t l2h = grd(g_mali, MALI_L2_PRESENT_HI);
++	LOG("present shader=%#x:%#x tiler=%#x:%#x l2=%#x:%#x\n",
++	    shh, shl, tih, til, l2h, l2l);
++	gwr(g_mali, MALI_L2_PWRON_LO, l2l);
++	gwr(g_mali, MALI_L2_PWRON_HI, l2h);
++	gwr(g_mali, MALI_TI_PWRON_LO, til);
++	gwr(g_mali, MALI_TI_PWRON_HI, tih);
++	gwr(g_mali, MALI_SH_PWRON_LO, shl);
++	gwr(g_mali, MALI_SH_PWRON_HI, shh);
++	int bad = 0;
++	bad |= mwait(g_mali, MALI_L2_READY_LO, l2l, l2l, 100000);
++	bad |= mwait(g_mali, MALI_L2_READY_HI, l2h, l2h, 100000);
++	bad |= mwait(g_mali, MALI_TI_READY_LO, til, til, 100000);
++	bad |= mwait(g_mali, MALI_TI_READY_HI, tih, tih, 100000);
++	bad |= mwait(g_mali, MALI_SH_READY_LO, shl, shl, 100000);
++	bad |= mwait(g_mali, MALI_SH_READY_HI, shh, shh, 100000);
++	if (bad) {
++		LOG("core power-on timeout ready l2=%#x ti=%#x sh=%#x\n",
++		    grd(g_mali, MALI_L2_READY_LO), grd(g_mali, MALI_TI_READY_LO),
++		    grd(g_mali, MALI_SH_READY_LO));
++		return -1;
++	}
++	g_cores_on = 1;
++	LOG("cores on: l2=%#x ti=%#x sh=%#x\n",
++	    grd(g_mali, MALI_L2_READY_LO), grd(g_mali, MALI_TI_READY_LO),
++	    grd(g_mali, MALI_SH_READY_LO));
++	return 0;
++}
++
++static void
++mali_cores_off(void)
++{
++	uint32_t shl = grd(g_mali, MALI_SH_PRESENT_LO);
++	uint32_t shh = grd(g_mali, MALI_SH_PRESENT_HI);
++	uint32_t til = grd(g_mali, MALI_TI_PRESENT_LO);
++	uint32_t tih = grd(g_mali, MALI_TI_PRESENT_HI);
++	uint32_t l2l = grd(g_mali, MALI_L2_PRESENT_LO);
++	uint32_t l2h = grd(g_mali, MALI_L2_PRESENT_HI);
++	gwr(g_mali, MALI_SH_PWROFF_LO, shl);
++	gwr(g_mali, MALI_SH_PWROFF_HI, shh);
++	gwr(g_mali, MALI_TI_PWROFF_LO, til);
++	gwr(g_mali, MALI_TI_PWROFF_HI, tih);
++	gwr(g_mali, MALI_L2_PWROFF_LO, l2l);
++	gwr(g_mali, MALI_L2_PWROFF_HI, l2h);
++	if (mwait(g_mali, MALI_SH_READY_LO, shl, 0, 100000) ||
++	    mwait(g_mali, MALI_SH_READY_HI, shh, 0, 100000) ||
++	    mwait(g_mali, MALI_TI_READY_LO, til, 0, 100000) ||
++	    mwait(g_mali, MALI_TI_READY_HI, tih, 0, 100000) ||
++	    mwait(g_mali, MALI_L2_READY_LO, l2l, 0, 100000) ||
++	    mwait(g_mali, MALI_L2_READY_HI, l2h, 0, 100000))
++		LOG("core power-off timeout ready sh=%#x ti=%#x l2=%#x\n",
++		    grd(g_mali, MALI_SH_READY_LO), grd(g_mali, MALI_TI_READY_LO),
++		    grd(g_mali, MALI_L2_READY_LO));
++	else
++		LOG("cores off\n");
++	g_cores_on = 0;
++}
++
++/* ---------------- GPU MMU (AS0, aarch64 4K, kbase layout) -------------- */
++
++static int g_pgd_used = 1; /* page 0 is the L0 table */
++
++static uint64_t
++pgd_alloc(void)
++{
++	if (g_pgd_used >= PGD_PAGES)
++		return 0;
++	return g_dma_pa + (uint64_t)g_pgd_used++ * 0x1000;
++}
++
++static volatile uint64_t *
++pgd_ptr(uint64_t pa)
++{
++	return (volatile uint64_t *)(g_dma + (pa - g_dma_pa));
++}
++
++/* map one 4K page at GPU VA == PA (identity map for debuggability) */
++static int
++gpu_map(uint64_t pa)
++{
++	uint64_t tbl = g_dma_pa; /* L0 */
++	for (int level = 0; level < 3; ++level) {
++		int idx = (int)((pa >> (39 - 9 * level)) & 0x1ff);
++		volatile uint64_t *e = pgd_ptr(tbl) + idx;
++		if (!(*e & 1)) {
++			uint64_t nt = pgd_alloc();
++			if (!nt)
++				return -1;
++			*e = nt | PTE_ACCESS | PTE_TABLE;
++		}
++		tbl = *e & ~0xfffull;
++	}
++	volatile uint64_t *ate = pgd_ptr(tbl) + ((pa >> 12) & 0x1ff);
++	*ate = (pa & ~0xfffull) | PTE_ACCESS | PTE_SHARE_INNER |
++	    PTE_ACCESS_RW | PTE_MEMATTR(0) | PTE_TABLE;
++	return 0;
++}
++
++static int
++gpu_as0_setup(void)
++{
++	uint64_t cfg = AS_CFG_AARCH64_4K | AS_CFG_PTW_MEMATTR_WB |
++	    AS_CFG_R_ALLOCATE;
++	uint64_t tt = g_dma_pa & ~0xfull; /* BASE_MASK, 4K-aligned pgd */
++	gwr(g_mali, AS0 + AS_TRANSCFG_LO, (uint32_t)cfg);
++	gwr(g_mali, AS0 + AS_TRANSCFG_HI, (uint32_t)(cfg >> 32));
++	gwr(g_mali, AS0 + AS_TRANSTAB_LO, (uint32_t)tt);
++	gwr(g_mali, AS0 + AS_TRANSTAB_HI, (uint32_t)(tt >> 32));
++	gwr(g_mali, AS0 + AS_MEMATTR_LO, (uint32_t)MEMATTR_DEFAULT);
++	gwr(g_mali, AS0 + AS_MEMATTR_HI, (uint32_t)(MEMATTR_DEFAULT >> 32));
++	gwr(g_mali, AS0 + AS_COMMAND, AS_CMD_UPDATE);
++	if (mwait(g_mali, AS0 + AS_STATUS, AS_STATUS_ACTIVE, 0, 10000)) {
++		LOG("as0 update timeout status=%#x\n",
++		    grd(g_mali, AS0 + AS_STATUS));
++		return -1;
++	}
++	g_as_mapped = 1;
++	LOG("as0 mapped transtab=%#llx\n", tt);
++	return 0;
++}
++
++static void
++gpu_as0_unmap(void)
++{
++	uint64_t cfg = AS_CFG_UNMAPPED;
++	gwr(g_mali, AS0 + AS_TRANSCFG_LO, (uint32_t)cfg);
++	gwr(g_mali, AS0 + AS_TRANSCFG_HI, 0);
++	gwr(g_mali, AS0 + AS_TRANSTAB_LO, 0);
++	gwr(g_mali, AS0 + AS_TRANSTAB_HI, 0);
++	gwr(g_mali, AS0 + AS_MEMATTR_LO, 0);
++	gwr(g_mali, AS0 + AS_MEMATTR_HI, 0);
++	gwr(g_mali, AS0 + AS_COMMAND, AS_CMD_UPDATE);
++	(void)mwait(g_mali, AS0 + AS_STATUS, AS_STATUS_ACTIVE, 0, 10000);
++	g_as_mapped = 0;
++}
++
++static void
++gpu_as0_fault_dump(void)
++{
++	uint32_t irq = grd(g_mali, MMU_IRQ_RAWSTAT);
++	if (!(irq & (MMU_PF(0) | MMU_BUS_ERR(0))))
++		return;
++	LOG("as0 %s fault: status=%#x addr=%#llx extra=%#llx\n",
++	    (irq & MMU_BUS_ERR(0)) ? "bus" : "page",
++	    grd(g_mali, AS0 + AS_FAULTSTATUS),
++	    ((uint64_t)grd(g_mali, AS0 + AS_FAULTADDR_HI) << 32) |
++	    grd(g_mali, AS0 + AS_FAULTADDR_LO),
++	    ((uint64_t)grd(g_mali, AS0 + AS_FAULTEXTRA_HI) << 32) |
++	    grd(g_mali, AS0 + AS_FAULTEXTRA_LO));
++}
++
++/* ---------------- M2: WRITE_VALUE job on JS0 ---------------- */
++
++static int
++gpu_job_test(void)
++{
++	uint64_t desc_pa = g_dma_pa + OFF_DESC;
++	uint64_t tgt_pa = g_dma_pa + OFF_TARGET;
++	volatile uint32_t *d32 = (volatile uint32_t *)(g_dma + OFF_DESC);
++	volatile uint64_t *d64 = (volatile uint64_t *)(g_dma + OFF_DESC);
++	volatile uint64_t *tgt = (volatile uint64_t *)(g_dma + OFF_TARGET);
++
++	/* page tables for the descriptor + target (GPU VA = PA) */
++	if (gpu_map(desc_pa) || gpu_map(tgt_pa)) {
++		LOG("page table build failed\n");
++		return -1;
++	}
++
++	/* descriptor: Job Header (32B) + Write Value payload */
++	d32[0] = 0;                             /* exception status */
++	d32[1] = 0;                             /* first incomplete task */
++	d64[1] = 0;                             /* fault pointer */
++	d32[4] = JH_IS64B | (JT_WRITE_VALUE << JH_TYPE_SHIFT);
++	d32[5] = 0;                             /* dependency 1|2 */
++	d64[3] = 0;                             /* next = end of chain */
++	d64[4] = tgt_pa;                        /* WVP address (GPU VA) */
++	d32[10] = WVT_IMMEDIATE64;              /* write-value type */
++	d32[11] = 0;
++	d64[6] = WV_MAGIC;
++	*tgt = WV_SENTINEL;
++
++	/* GPU is not cache-coherent: push tables+descriptor+target to DRAM */
++	flush_dcache64(g_dma_pa, (unsigned)(PGD_PAGES * 0x1000), TRUE);
++	flush_dcache64(desc_pa, 0x40, TRUE);
++	flush_dcache64(tgt_pa, 0x40, TRUE);
++
++	if (gpu_as0_setup())
++		return -2;
++
++	uint32_t shl = grd(g_mali, MALI_SH_PRESENT_LO);
++	gwr(g_mali, JS0 + JS_AFFINITY_NEXT_LO, shl);
++	gwr(g_mali, JS0 + JS_AFFINITY_NEXT_HI, 0);
++	gwr(g_mali, JS0 + JS_HEAD_NEXT_LO, (uint32_t)desc_pa);
++	gwr(g_mali, JS0 + JS_HEAD_NEXT_HI, (uint32_t)(desc_pa >> 32));
++	gwr(g_mali, JS0 + JS_CONFIG_NEXT,
++	    0 | JSC_START_FLUSH_CI | JSC_END_FLUSH_CI | JSC_THREAD_PRI(8));
++	gwr(g_mali, JS0 + JS_COMMAND_NEXT, JSC_START);
++	LOG("job submitted js_head=%#llx\n", desc_pa);
++
++	/* wait for slot0 DONE (bit0) or FAIL (bit16) -- either terminates it */
++	int done = 0;
++	for (int i = 0; i < 100000; ++i) {
++		if (grd(g_mali, JOB_IRQ_RAWSTAT) & ((1u << 0) | (1u << 16))) {
++			done = 1;
++			break;
++		}
++		delay(1);
++	}
++	if (!done) {
++		LOG("job timeout rawstat=%#x js_status=%#x\n",
++		    grd(g_mali, JOB_IRQ_RAWSTAT), grd(g_mali, JS0 + JS_STATUS));
++		gpu_as0_fault_dump();
++		return -3;
++	}
++	uint32_t st = grd(g_mali, JS0 + JS_STATUS);
++	gwr(g_mali, JOB_IRQ_CLEAR, 0xffffffffu);
++	gpu_as0_fault_dump();
++	flush_dcache64(tgt_pa, 0x40, TRUE); /* drop CPU copies before reread */
++	uint64_t got = *tgt;
++	LOG("job done: js_status=%#x value=%#llx\n", st, got);
++	if (st != 0 || got != WV_MAGIC) {
++		LOG("M2 FAIL (status=%#x value=%#llx)\n", st, got);
++		return -4;
++	}
++	LOG("M2 PASS: WRITE_VALUE job verified %#llx\n", got);
++	return 0;
++}
++
++/* ---------------- driver thread ---------------- */
++
++static void
++gpu_power_down(void)
++{
++	if (g_cores_on)
++		mali_cores_off();
++	if (g_as_mapped)
++		gpu_as0_unmap();
++	if (g_cg_on) {
++		gpu_bus_idle();
++		gwr(g_mfgcfg, MFGCG_SET, 1);            /* re-gate bg3d */
++		(void)mwait(g_mfgcfg, MFGCG_STA, 1, 1, 5000);
++		g_cg_on = 0;
++		LOG("bg3d gated sta=%#x\n", grd(g_mfgcfg, MFGCG_STA));
++	}
++	/* children of MFG1 first, then MFG1, then MFG0 */
++	if (g_mfg_on[5]) { mfg_sram(SP_MFG5_CON, 1, "mfg5");
++		mfg_pwr_off(SP_MFG5_CON, STA_MFG5, "mfg5"); g_mfg_on[5] = 0; }
++	if (g_mfg_on[3]) { mfg_sram(SP_MFG3_CON, 1, "mfg3");
++		mfg_pwr_off(SP_MFG3_CON, STA_MFG3, "mfg3"); g_mfg_on[3] = 0; }
++	if (g_mfg_on[2]) { mfg_sram(SP_MFG2_CON, 1, "mfg2");
++		mfg_pwr_off(SP_MFG2_CON, STA_MFG2, "mfg2"); g_mfg_on[2] = 0; }
++	if (g_mfg_on[1]) { (void)mfg1_bus_protect();
++		mfg_pwr_off(SP_MFG1_CON, STA_MFG1, "mfg1"); g_mfg_on[1] = 0; }
++	if (g_mfg_on[0]) { mfg_sram(SP_MFG0_CON, 1, "mfg0");
++		mfg_pwr_off(SP_MFG0_CON, STA_MFG0, "mfg0"); g_mfg_on[0] = 0; }
++	if (g_rail_vgpu || g_rail_vsram)
++		gpu_pmic_down();
++	if (g_dma_used) {
++		kmem_free(kernel_map, g_dma, DMA_SIZE);
++		g_dma = 0;
++		g_dma_used = 0;
++	}
++}
++
++static void
++gpu_thread(void *arg, wait_result_t result)
++{
++	int rc = 0;
++	(void)arg;
++	(void)result;
++
++	/* phase 1: rails */
++	rc = gpu_pmic_up();
++	if (rc)
++		goto out;
++
++	/* phase 2: MTCMOS, children of MFG1 after it */
++	if (mfg_pwr_on(0, SP_MFG0_CON, STA_MFG0, "mfg0") ||
++	    mfg_pwr_on(1, SP_MFG1_CON, STA_MFG1, "mfg1") ||
++	    mfg1_bus_release() ||
++	    mfg_pwr_on(2, SP_MFG2_CON, STA_MFG2, "mfg2") ||
++	    mfg_pwr_on(3, SP_MFG3_CON, STA_MFG3, "mfg3") ||
++	    mfg_pwr_on(5, SP_MFG5_CON, STA_MFG5, "mfg5")) {
++		rc = -10;
++		goto out;
++	}
++
++	/* phase 3: clock gates */
++	if (gpu_cg_on()) {
++		rc = -11;
++		goto out;
++	}
++
++	/* phase 4: mali init */
++	uint32_t id = grd(g_mali, MALI_GPU_ID);
++	LOG("GPU_ID=%#08x AS=%#x JS=%#x L2f=%#x COREf=%#x MMUf=%#x\n",
++	    id, grd(g_mali, MALI_AS_PRESENT), grd(g_mali, MALI_JS_PRESENT),
++	    grd(g_mali, MALI_L2_FEATURES), grd(g_mali, MALI_CORE_FEATURES),
++	    grd(g_mali, MALI_MMU_FEATURES));
++	if (id == 0 || id == 0xffffffffu || mali_soft_reset() ||
++	    mali_cores_on()) {
++		rc = -12;
++		goto out;
++	}
++	if (!(grd(g_mali, MALI_AS_PRESENT) & 1)) {
++		LOG("AS0 not present, skipping job test\n");
++		rc = -13;
++		goto out;
++	}
++
++	/* phase 5: M2 self-test */
++	if (g_nojob) {
++		LOG("sweetgpu_nojob=1, stopping after core power-on\n");
++	} else {
++		if (kmem_alloc_contig(kernel_map, &g_dma, DMA_SIZE,
++		    PAGE_MASK, 0, 0, KMA_DATA | KMA_ZERO | KMA_PERMANENT,
++		    VM_KERN_MEMORY_IOKIT) != KERN_SUCCESS) {
++			LOG("no contiguous DMA memory\n");
++			rc = -14;
++			goto out;
++		}
++		ppnum_t pn = pmap_find_phys(kernel_pmap, (addr64_t)g_dma);
++		if (!pn) {
++			LOG("pmap_find_phys failed\n");
++			rc = -15;
++			goto out;
++		}
++		g_dma_pa = ptoa_64(pn);
++		g_dma_used = 1;
++		LOG("dma arena va=%#lx pa=%#llx\n", g_dma, g_dma_pa);
++		rc = gpu_job_test();
++	}
++
++out:
++	if (g_keep) {
++		LOG("sweetgpu_keep=1: leaving GPU powered, as0=%d cores=%d\n",
++		    g_as_mapped, g_cores_on);
++	} else {
++		gpu_power_down();
++		LOG("teardown complete (rc=%d)\n", rc);
++	}
++}
++
++void
++sweet_gpu_init(void)
++{
++	static int started;
++	int enabled = 0;
++	thread_t thread;
++	if (started)
++		return;
++	started = 1;
++	(void)PE_parse_boot_argn("sweetgpu", &enabled, sizeof(enabled));
++	(void)PE_parse_boot_argn("sweetgpu_keep", &g_keep, sizeof(g_keep));
++	(void)PE_parse_boot_argn("sweetgpu_nojob", &g_nojob, sizeof(g_nojob));
++	if (!enabled) {
++		LOG("off (sweetgpu=1 to power on Mali-G57 and run the M2 test)\n");
++		return;
++	}
++	g_pwrap = ml_io_map(GPU_PWRAP_PA, 0x1000);
++	g_spm = ml_io_map(GPU_SPM_PA, 0x1000);
++	g_infra = ml_io_map(GPU_INFRA_PA, 0x1000);
++	g_ipdn = ml_io_map(GPU_IPDN_PA, 0x1000);
++	g_mfgcfg = ml_io_map(GPU_MFGCFG_PA, 0x1000);
++	g_mali = ml_io_map(GPU_MALI_PA, 0x4000);
++	if (!g_pwrap || !g_spm || !g_infra || !g_ipdn || !g_mfgcfg || !g_mali) {
++		LOG("MMIO map failed\n");
++		return;
++	}
++	kern_return_t kr = kernel_thread_start(gpu_thread, NULL, &thread);
++	if (kr == KERN_SUCCESS)
++		thread_deallocate(thread);
++	else
++		LOG("kernel_thread_start failed %d\n", kr);
++}
++#endif /* ARM64_BOARD_CONFIG_SWEET */
+--- a/bsd/dev/sweet_keys.c
++++ b/bsd/dev/sweet_keys.c
+@@ -40,6 +40,7 @@
+ #include <sys/systm.h>
+ #include <kern/clock.h>
+ #include <kern/thread.h>
++#include <kern/locks.h>
+ #include <kern/sched_prim.h>
+ #include <machine/machine_routines.h>
+ #include <pexpert/pexpert.h>
+@@ -47,6 +48,28 @@
+ extern vm_offset_t ml_io_map(vm_offset_t, vm_size_t);
+ extern void sweet_hid_key(int key, int down);
+ void sweet_keys_init(void);
++void sweet_pwrap_lock(void);
++void sweet_pwrap_unlock(void);
++
++/*
++ * SWINF_2 is the only AP generic pwrap channel on MT6853: this driver
++ * and sweet_gpu.c both issue PMIC transactions through it, so every
++ * transaction must hold this mutex.
++ */
++static LCK_GRP_DECLARE(keys_pwrap_grp, "keys_pwrap");
++static LCK_MTX_DECLARE(keys_pwrap_mtx, &keys_pwrap_grp);
++
++void
++sweet_pwrap_lock(void)
++{
++	lck_mtx_lock(&keys_pwrap_mtx);
++}
++
++void
++sweet_pwrap_unlock(void)
++{
++	lck_mtx_unlock(&keys_pwrap_mtx);
++}
+ 
+ #define KEYS_GPIO_PA        0x10005000u
+ #define KEYS_IOC_BR_PA      0x11D40000u
+@@ -185,8 +208,12 @@
+ 		 * A line arms only after it has been seen released, so a
+ 		 * permanently-low wrong pad can never emit a press. */
+ 		uint32_t st = 0;
+-		int pm_ok = (keys_pwrap && pwr_err < 50 &&
+-		    pmic_read16(MT6359_TOPSTATUS, &st) == 0);
++		int pm_ok = 0;
++		if (keys_pwrap && pwr_err < 50) {
++			sweet_pwrap_lock();
++			pm_ok = (pmic_read16(MT6359_TOPSTATUS, &st) == 0);
++			sweet_pwrap_unlock();
++		}
+ 		int vu_line[2];
+ 		vu_line[0] = !key_din(PIN_VOLUP);
+ 		vu_line[1] = pm_ok ? !(st & MT6359_HOMEKEY_DEB) : vu_state[1];
